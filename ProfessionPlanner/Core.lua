@@ -550,8 +550,23 @@ local function buildPlanSingle(req, profile, prices)
             for _, alternative in ipairs(item.alts) do
                 table.insert(alternatives, { spell = alternative.spell, name = alternative.name, delta = math.floor(alternative.score - item.score + 0.5) })
             end
+            -- What to do with the crafted items: how the plan counts them, and what the other
+            -- outlet would pay, so the player can see where the sell-back comes from.
+            local sell
+            if product then
+                local made = item.crafts * product.qty
+                local data = ctx.D["items"][product.item]
+                local record = ctx.prices and ctx.prices.rec(product.item) or nil
+                local _, how = ns.SellValue(ctx, product.item, product.qty)
+                sell = {
+                    how = how, made = made,
+                    vendor = math.floor((data and data.sell or 0) * made + 0.5),
+                    ah = record and (record.med or 0) >= 200 and math.floor(0.95 * record.med * made + 0.5) or nil,
+                    perDay = record and record.spd or 0,
+                }
+            end
             table.insert(outSteps, {
-                type = "step", ["from"] = startSkill, to = endSkill, recipe = recipe.name, spell = recipe.spell,
+                type = "step", sell = sell, ["from"] = startSkill, to = endSkill, recipe = recipe.name, spell = recipe.spell,
                 crafts = item.crafts, safeCrafts = item.crafts,
                 band = item.colourStart == item.colourEnd and item.colourStart or (item.colourStart .. " to " .. item.colourEnd),
                 via = item.availability.via, learn = recipe.learn, approx = recipe.approx, learnSrc = recipe.learnSrc,

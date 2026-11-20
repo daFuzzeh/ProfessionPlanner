@@ -538,7 +538,7 @@ local function buildSidebar(ui, frame)
 
     local profTitle = W.text(side, 10, C.faint, "PROFESSIONS")
     profTitle:SetPoint("TOPLEFT", 12, -92)
-    ui.profRows = {}
+    ui.profRows, ui.profOrder = {}, {}
     local index = 0
     for _, name in ipairs(PROFESSIONS) do
         if ns.D.by_prof[name] then
@@ -574,8 +574,19 @@ local function buildSidebar(ui, frame)
             row.profession = name
             row:SetScript("OnClick", function(self) selectProfession(self.profession) end)
             ui.profRows[name] = row
+            table.insert(ui.profOrder, row)
         end
     end
+    -- Normally only the character's own professions are listed; this shows the rest, for
+    -- planning one not learned yet.
+    ui.allProfs = W.button(side, "", SIDE_W - 24, 22, nil, function()
+        ns.DB.settings.allProfessions = not ns.DB.settings.allProfessions
+        ns.RefreshUI()
+    end)
+    ui.profNote = W.text(side, 10, C.faint, "")
+    ui.profNote:SetWidth(SIDE_W - 24)
+    ui.profNote:SetJustifyH("LEFT")
+    ui.profNote:SetWordWrap(true)
 end
 
 local function buildControls(ui, frame)
@@ -1030,6 +1041,25 @@ local function renderRoute(ui, plan, y)
                 local where = step.pattern.src == "Vendor" and "Buy from a vendor: " or "Buy on the AH: "
                 cy = cy - put(ui, x, cy, wide, where .. step.pattern.name .. " for " .. ns.Coins(step.pattern.price), 11, C.accent, "LEFT", true) - 4
             end
+            if step.sell and step.product then
+                local sell, text = step.sell, nil
+                local what = sell.made .. " x " .. step.product
+                local rate = string.format("%.1f", sell.perDay or 0)
+                if sell.how == "AH" then
+                    text = "Sell on the AH: " .. what .. " for about " .. ns.Coins(sell.ah or 0) .. " after the cut (about " .. rate .. " sell a day)."
+                    if sell.vendor > 0 then text = text .. " A vendor pays " .. ns.Coins(sell.vendor) .. "." end
+                elseif sell.how == "vendor" then
+                    if sell.vendor > 0 then text = "Sell to a vendor: " .. what .. " for " .. ns.Coins(sell.vendor) .. "."
+                    else text = "Nothing counted for the " .. what .. ": a vendor pays nothing for it." end
+                    -- Point out an AH price that clearly beats the vendor and actually sells.
+                    if sell.ah and sell.ah > sell.vendor * 1.25 and (sell.perDay or 0) >= 1 then
+                        text = text .. hex(C.good) .. " The AH pays about " .. ns.Coins(sell.ah) .. " (about " .. rate .. " sell a day)." .. DONE
+                    end
+                else
+                    text = "Sell-back is not counted (see Options)."
+                end
+                cy = cy - put(ui, x, cy, wide, text, 11, C.dim, "LEFT", true) - 4
+            end
             if step.pattern and step.pattern.stock then
                 local clock = rawget(_G, "time")
                 local text = ns.StockText(step.pattern.stock, type(clock) == "function" and clock() or nil)
@@ -1164,7 +1194,7 @@ local function renderRecipes(ui, plan, y)
 end
 
 local PROFIT_COLUMNS = {
-    { title = "RECIPE", x = 40, w = 216 }, { title = "SELLS AS", x = 260, w = 196 },
+    { title = "RECIPE", x = 40, w = 216 }, { title = "SELLS AS", x = 260, w = 138 }, { title = "SELL AT", x = 402, w = 54 },
     { title = "PROFIT EACH", x = 460, w = 92, right = true }, { title = "SOLD / DAY", x = 556, w = 72, right = true },
     { title = "SKILL-UP", x = 632, w = 64, right = true }, { title = "PROFIT / DAY", x = 700, w = 100, right = true },
 }
@@ -1178,7 +1208,7 @@ local function renderProfit(ui, plan, y)
         if not request.bothOnly or row.both then table.insert(shown, row) end
     end
     if #shown == 0 then return banner(ui, y, "No recipe makes a profit at current prices with these options.", C.info) end
-    y = banner(ui, y, "Recipes available at skill " .. request["from"] .. " that sell for more than their materials. Profit per day assumes you sell at most 20 a day.", C.info)
+    y = banner(ui, y, "Recipes available at skill " .. request["from"] .. " that sell for more than their materials. Sell at: AH means the market price less the 5% cut; Vendor means the item has no usable AH price. Profit per day assumes you sell at most 20 a day.", C.info)
     y = heading(ui, y, PROFIT_COLUMNS)
     for index, row in ipairs(shown) do
         local note = row.source and row.via ~= "known" and row.via ~= "auto" and ns.SourceForFaction(row.source, ns.profile and ns.profile.faction) or nil
@@ -1189,7 +1219,8 @@ local function renderProfit(ui, plan, y)
         rowIcon(ui, 10, y - 3, 20, row.item, row.product)
         local chance = math.floor(row.chance * 100 + 0.5)
         put(ui, 40, y - 7, 216, row.recipe, 11, BAND[row.colour or ""] or C.text)
-        put(ui, 260, y - 7, 196, row.product .. (row.sellHow == "vendor" and "  (vendor)" or ""), 11, QUALITY[row.q or 1] or C.dim)
+        put(ui, 260, y - 7, 138, row.product, 11, QUALITY[row.q or 1] or C.dim)
+        put(ui, 402, y - 7, 54, row.sellHow == "vendor" and "Vendor" or "AH", 11, row.sellHow == "vendor" and C.dim or C.info)
         put(ui, 460, y - 7, 92, ns.Coins(row.margin), 11, C.good, "RIGHT")
         put(ui, 556, y - 7, 72, string.format("%.1f", row.perDay), 11, C.dim, "RIGHT")
         put(ui, 632, y - 7, 64, chance > 0 and (chance .. "%") or "-", 11, chance > 0 and C.text or C.faint, "RIGHT")
@@ -1256,6 +1287,39 @@ local function refreshSidebar(ui, request, char)
     ui.charDrop.SetValues(ns.SortedCharacters(ns.profile))
     ui.charDrop.SetText(char and (char.name or request.char) or "No TSM character data")
     if char and char.money then ui.gold:SetText("Gold  " .. ns.Coins(char.money)) else ui.gold:SetText("") end
+    local known = 0
+    for name in pairs(ui.profRows) do
+        if char and char.profs and char.profs[name] then known = known + 1 end
+    end
+    -- With nothing recorded for the character there is nothing to narrow the list to.
+    local all = known == 0 or (ns.DB and ns.DB.settings.allProfessions == true)
+    local shown = 0
+    for _, row in ipairs(ui.profOrder) do
+        local mine = char and char.profs and char.profs[row.profession] ~= nil
+        if all or mine or row.profession == request.prof then
+            row:ClearAllPoints()
+            row:SetPoint("TOPLEFT", 0, -108 - shown * 40)
+            row:Show()
+            shown = shown + 1
+        else
+            row:Hide()
+        end
+    end
+    local below = -108 - shown * 40 - 8
+    ui.allProfs:ClearAllPoints()
+    ui.profNote:ClearAllPoints()
+    if known == 0 then
+        ui.allProfs:Hide()
+        ui.profNote:SetPoint("TOPLEFT", 12, below)
+        ui.profNote:SetText("TradeSkillMaster has no professions for this character yet. Open each profession window once.")
+        ui.profNote:Show()
+    elseif known == #ui.profOrder then
+        ui.allProfs:Hide(); ui.profNote:Hide()
+    else
+        ui.allProfs:SetPoint("TOPLEFT", 12, below)
+        ui.allProfs.label:SetText(all and "Show only mine" or "Show all professions")
+        ui.allProfs:Show(); ui.profNote:Hide()
+    end
     for name, row in pairs(ui.profRows) do
         local values = char and char.profs and char.profs[name] or nil
         local level = values and math.max(0, math.min(ns.MAX_SKILL, tonumber(values.level) or 0)) or nil
@@ -1309,6 +1373,8 @@ local function refreshSummary(ui, request, char, plan)
     ui.cards.perPoint.value:SetText(summary.crafts > 0 and ns.Coins(summary.net / points) or "-")
     ui.cards.spend.value:SetText(ns.Coins(summary.spend))
     ui.cards.sellBack.value:SetText(ns.Coins(summary.sellBack))
+    local outlet = request.credit == "ah" and "AH, ELSE VENDOR" or (request.credit == "none" and "NOT COUNTED" or "VENDOR")
+    ui.cards.sellBack.caption:SetText("SELL-BACK (" .. outlet .. ")")
     ui.cards.crafts.value:SetText(tostring(summary.crafts))
 end
 

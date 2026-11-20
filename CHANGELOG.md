@@ -1,5 +1,12 @@
 # Changes
 
+## 1.4.2
+- The professions list shows only the selected character's professions, with a "Show all professions" button underneath.
+
+## 1.4.1
+- Every route step says where its sell-back comes from (vendor or auction house) and for how much, and points out when the auction house clearly pays more.
+- The Sell-back card names the outlet in use; the Profit tab has a "Sell at" column.
+
 ## 1.4.0
 - Vendor recipes sold in limited numbers are marked, with the restock time and what the route costs without them.
 - "Limited stock" switch next to the tabs, to stop the route relying on those recipes.

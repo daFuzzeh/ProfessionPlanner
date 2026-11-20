@@ -2,7 +2,7 @@
 ## Title: Profession Planner
 ## Notes: Cheapest Forever profession routes, TSM shopping lists and recipe locations.
 ## Author: Profession Planner contributors
-## Version: 1.4.0
+## Version: 1.4.2
 ## OptionalDeps: TradeSkillMaster
 ## SavedVariables: ProfessionPlannerDB
 Data.lua

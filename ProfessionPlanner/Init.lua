@@ -1,6 +1,6 @@
 local addonName, ns = ...
 
-ns.VERSION = "1.4.0"
+ns.VERSION = "1.4.2"
 
 -- Option keys that are restored from the saved variables. Character, profession and skill
 -- range are restored separately because they depend on who is logged in.
