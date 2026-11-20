@@ -1,0 +1,23 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the addon ZIP
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          toc=$(sed -n 's/^## Version:[[:space:]]*//p' ProfessionPlanner/ProfessionPlanner.toc | tr -d '\r')
+          if [ "$toc" != "$version" ]; then echo "Tag $version does not match the TOC version $toc"; exit 1; fi
+          (cd ProfessionPlanner && sha256sum *.lua *.toc *.md *.txt > SHA256SUMS.txt)
+          zip -r -9 "ProfessionPlanner-$version.zip" ProfessionPlanner
+          echo "ZIP=ProfessionPlanner-$version.zip" >> "$GITHUB_ENV"
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" "$ZIP" --title "Profession Planner ${GITHUB_REF_NAME#v}" --notes "Test build. Install steps are in the README. Changes are in CHANGELOG.md."
