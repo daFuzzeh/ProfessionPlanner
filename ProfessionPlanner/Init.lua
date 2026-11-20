@@ -1,10 +1,10 @@
 local addonName, ns = ...
 
-ns.VERSION = "1.3.0"
+ns.VERSION = "1.4.0"
 
 -- Option keys that are restored from the saved variables. Character, profession and skill
 -- range are restored separately because they depend on who is logged in.
-local OPTION_KEYS = { "strictCheapest", "patterns", "vendorPatterns", "useStock", "altStock", "ahMode", "credit",
+local OPTION_KEYS = { "strictCheapest", "patterns", "vendorPatterns", "limitedPatterns", "useStock", "altStock", "ahMode", "credit",
     "cooldowns", "stations", "discolored", "simulate", "bothOnly" }
 
 local function currentCharacter()
@@ -120,9 +120,15 @@ end
 local events = CreateFrame("Frame")
 events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
+events:RegisterEvent("MERCHANT_SHOW")
+events:RegisterEvent("MERCHANT_UPDATE")
 events:SetScript("OnEvent", function(_, event, name)
     if event == "ADDON_LOADED" then
         if name == addonName then ns.Initialize() end
+    elseif event == "MERCHANT_SHOW" or event == "MERCHANT_UPDATE" then
+        -- Never let a problem here interfere with the vendor window.
+        pcall(ns.ScanMerchant)
+        if event == "MERCHANT_SHOW" then pcall(ns.ArrivedAtVendor) end
     elseif event == "PLAYER_LOGIN" then
         -- Character, realm and TSM's data are all reliable by now; read them again.
         if not ns.DB then

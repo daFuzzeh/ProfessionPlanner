@@ -53,6 +53,7 @@ local OPTIONS = {
     flag("stations", "Route", "Allow special stations", "Use recipes that need a special forge, anvil or similar.", false),
     flag("discolored", "Route", "Silverpine quest recipe", "Include Discolored Healing Potion, taught by a quest.", false),
     flag("vendorPatterns", "Recipes to buy", "Buy vendor recipes", "Use a recipe sold by a vendor when that makes the route cheaper.", true),
+    flag("limitedPatterns", "Recipes to buy", "Buy limited-stock recipes", "Use vendor recipes sold one at a time, which may be sold out or camped.", true),
     { key = "ahPatterns", group = "Recipes to buy", label = "Buy AH recipes", hint = "Use a recipe listed on the auction house when that makes the route cheaper.",
         get = function(request) return request.patterns == "buyable" end,
         set = function(request, on) request.patterns = on and "buyable" or "known" end },
@@ -109,7 +110,7 @@ function ns.DefaultRequest(profile)
     end
     return {
         char = charId, prof = profession, ["from"] = level, to = ns.NextCap(level),
-        strictCheapest = true, patterns = "known", vendorPatterns = true, useStock = true, altStock = false,
+        strictCheapest = true, patterns = "known", vendorPatterns = true, limitedPatterns = true, useStock = true, altStock = false,
         ahMode = "median", credit = "vendor", cooldowns = false, stations = false,
         discolored = false, simulate = true, bothOnly = false, exclude = {},
     }
@@ -687,7 +688,7 @@ local function buildControls(ui, frame)
     -- as well as in the Options panel.
     ui.chips = {}
     local chipX = -14
-    for _, chip in ipairs({ { "ahPatterns", "AH recipes", 92 }, { "vendorPatterns", "Vendor recipes", 112 } }) do
+    for _, chip in ipairs({ { "ahPatterns", "AH recipes", 92 }, { "limitedPatterns", "Limited stock", 100 }, { "vendorPatterns", "Vendor recipes", 112 } }) do
         local definition
         for _, option in ipairs(OPTIONS) do if option.key == chip[1] then definition = option end end
         local button = W.button(frame, chip[2], chip[3], 22, nil, function()
@@ -1029,15 +1030,23 @@ local function renderRoute(ui, plan, y)
                 local where = step.pattern.src == "Vendor" and "Buy from a vendor: " or "Buy on the AH: "
                 cy = cy - put(ui, x, cy, wide, where .. step.pattern.name .. " for " .. ns.Coins(step.pattern.price), 11, C.accent, "LEFT", true) - 4
             end
+            if step.pattern and step.pattern.stock then
+                local clock = rawget(_G, "time")
+                local text = ns.StockText(step.pattern.stock, type(clock) == "function" and clock() or nil)
+                if step.without then text = text .. " " .. step.without end
+                cy = cy - put(ui, x, cy, wide, text, 11, C.warn, "LEFT", true) - 4
+            end
             if step.via ~= "known" and step.via ~= "auto" and (step.source or step.learnSrc) then
                 local faction = ns.profile and ns.profile.faction
                 local source = step.source or step.learnSrc
                 -- A recipe to buy from a vendor gets a button that pins the vendor on the map.
                 local mapped = step.pattern and step.pattern.src == "Vendor" and #ns.VendorStops(source, faction) > 0
-                local room = mapped and (wide - 104) or wide
+                local pinnedHere = mapped and ns.pinned and ns.pinned.source == source
+                local room = mapped and (wide - (pinnedHere and 182 or 104)) or wide
                 local height = put(ui, x, cy, room, "Learn: " .. ns.SourceWithCoords(source, faction), 11, C.dim, "LEFT", true)
                 if mapped then
                     rowButton(ui, x + wide - 96, cy + 4, "Show on map", function() ns.ShowVendor(source, faction) end, 96)
+                    if pinnedHere then rowButton(ui, x + wide - 174, cy + 4, "Clear pin", function() ns.ClearPin() end, 72) end
                     height = math.max(height, 20)
                 end
                 cy = cy - height - 4
@@ -1126,6 +1135,7 @@ local function renderRecipes(ui, plan, y)
         local avoided = row.why == "avoided by you"
         local status = STATUS[row.via or ""]
         local statusText, statusColour = status and status[1] or "Not available", status and C[status[2]] or C.faint
+        if row.limited then statusText, statusColour = "Buy (limited)", C.warn end
         if avoided then statusText, statusColour = "Avoided", C.warn end
         local note
         if not row.via and row.why and not avoided then note = row.why
@@ -1337,6 +1347,23 @@ function ns.RefreshUI()
         local message = string.gsub(tostring(plan), "^.-:%d+: ", "")
         plan = failedPlan(request, message)
         ui.status:SetText("Planning failed")
+    end
+    -- For recipes that may be sold out, say what going without would cost (a few at most).
+    local checked = 0
+    for _, step in ipairs(plan.steps) do
+        if step.type == "step" and step.pattern and step.pattern.stock and checked < 6 then
+            checked = checked + 1
+            local without = copyTable(request)
+            without.exclude = copyTable(request.exclude)
+            table.insert(without.exclude, step.spell)
+            local fine, other = pcall(ns.BuildPlan, without, ns.profile, ns.prices)
+            if fine and other.reached < plan.reached then
+                step.without = "Without it the route stops at skill " .. other.reached .. "."
+            elseif fine then
+                local extra = other.summary.net - plan.summary.net
+                step.without = extra > 0 and ("Without it the route costs " .. ns.Coins(extra) .. " more.") or "The route costs no more without it."
+            end
+        end
     end
     ui.currentPlan = plan
     refreshSummary(ui, request, char, plan)

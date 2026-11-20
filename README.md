@@ -19,6 +19,7 @@ For auction prices, stock, gold and known recipes you need **TradeSkillMaster 4*
 - Shopping list with a search string to paste into TSM Shopping.
 - Recipes to buy are optional: switch vendor and auction-house recipes on or off and watch the cost change.
 - "Show on map" places the game's own map pin on the vendor that sells a recipe, for your faction.
+- Marks vendor recipes that are sold one at a time and are often sold out or camped, and can plan around them.
 - Names the next cheapest recipes for each step, for when a material is bought out.
 - A Profit tab for recipes that sell for more than their materials.
 
@@ -30,4 +31,4 @@ Open an [issue](../../issues) and include: the addon version (shown next to the 
 
 ## Credits and licence
 
-MIT licence. Recipe acquisition text is from [Classic WoW Forever](https://classicwowforever.com/) (CC BY 4.0). Vendor map positions are from the [pfQuest](https://github.com/shagu/pfQuest) database by Shagu (MIT). See [LICENSE](LICENSE). Not affiliated with Blizzard Entertainment or TradeSkillMaster.
+MIT licence. Recipe acquisition text is from [Classic WoW Forever](https://classicwowforever.com/) (CC BY 4.0). Vendor map positions are from the [pfQuest](https://github.com/shagu/pfQuest) database by Shagu (MIT). Vendor stock limits are from the [CMaNGOS Classic database](https://github.com/cmangos/classic-db) (GPL-3.0); that one table is offered under GPL-3.0. See [LICENSE](LICENSE). Not affiliated with Blizzard Entertainment or TradeSkillMaster.

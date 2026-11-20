@@ -118,6 +118,43 @@ function ns.SortStops(stops)
     return result
 end
 
+local tomtomPin
+
+-- Remove the pin this addon placed. A pin the player has since put somewhere else is left
+-- alone. `reason` starts the chat message; pass false for no message.
+function ns.ClearPin(reason)
+    local ours = ns.pinned
+    if not ours then return false end
+    ns.pinned = nil
+    local maps = rawget(_G, "C_Map")
+    if type(maps) == "table" and type(maps.ClearUserWaypoint) == "function" then
+        local still = true
+        if type(maps.GetUserWaypoint) == "function" then
+            local ok, point = pcall(maps.GetUserWaypoint)
+            still = ok and type(point) == "table" and point.uiMapID == ours.map and type(point.position) == "table"
+                and math.abs((point.position.x or 0) - ours.x) < 0.002 and math.abs((point.position.y or 0) - ours.y) < 0.002
+        end
+        if still then pcall(maps.ClearUserWaypoint) end
+    end
+    local tomtom = rawget(_G, "TomTom")
+    if tomtomPin and type(tomtom) == "table" and type(tomtom.RemoveWaypoint) == "function" then
+        pcall(tomtom.RemoveWaypoint, tomtom, tomtomPin)
+    end
+    tomtomPin = nil
+    if reason ~= false then say((reason or "Map pin") .. " cleared.") end
+    if ns.UI and ns.UI.frame and ns.UI.frame:IsShown() then ns.RefreshUI() end
+    return true
+end
+
+-- Talking to the vendor the pin points at means the trip is done.
+function ns.ArrivedAtVendor()
+    local unitName = rawget(_G, "UnitName")
+    if not ns.pinned or type(unitName) ~= "function" then return false end
+    local ok, vendor = pcall(unitName, "npc")
+    if ok and vendor == ns.pinned.name then return ns.ClearPin("Reached " .. vendor .. "; map pin") end
+    return false
+end
+
 -- Pin one vendor and open the map on it. Returns true when a pin was placed.
 function ns.ShowStop(stop, another)
     local mapId = ns.FindMap(stop.zone)
@@ -143,8 +180,11 @@ function ns.ShowStop(stop, another)
     end
     local tomtom = rawget(_G, "TomTom")
     if stop.x and type(tomtom) == "table" and type(tomtom.AddWaypoint) == "function" then
-        pcall(tomtom.AddWaypoint, tomtom, mapId, stop.x / 100, stop.y / 100, { title = stop.name, from = "Profession Planner" })
+        local ok, uid = pcall(tomtom.AddWaypoint, tomtom, mapId, stop.x / 100, stop.y / 100, { title = stop.name, from = "Profession Planner" })
+        tomtomPin = ok and uid or nil
     end
+    -- Remember our pin so it can be removed again, by the button or on reaching the vendor.
+    if pinned then ns.pinned = { name = stop.name, zone = stop.zone, map = mapId, x = stop.x / 100, y = stop.y / 100 } end
     local open = rawget(_G, "OpenWorldMap")
     if type(open) == "function" then pcall(open, mapId) end
     local message
@@ -165,5 +205,135 @@ function ns.ShowVendor(source, faction)
     if lastSource == source then lastIndex = lastIndex % #stops + 1 else lastSource, lastIndex = source, 1 end
     local stop = stops[lastIndex]
     ns.ShowStop(stop, #stops > 1 and stops[lastIndex % #stops + 1] or nil)
+    if ns.pinned then ns.pinned.source = source end
+    if ns.UI and ns.UI.frame and ns.UI.frame:IsShown() then ns.RefreshUI() end
     return stop
+end
+
+-- Limited vendor stock --------------------------------------------------------
+-- Some vendors hold only one or two of a recipe and take hours to get another, so those
+-- recipes are often sold out or camped. Two sources say which: bundled data describing the
+-- original game (see LICENSE.txt), and what this player has actually seen in vendor windows
+-- (`seen[itemId][vendorName] = { left = n, at = time }`, left = -1 for no limit). What was
+-- seen always wins.
+
+local function contains(list, value)
+    for _, item in ipairs(list or {}) do if item == value then return true end end
+    return false
+end
+
+-- nil when the recipe item can always be bought from some vendor this faction can use.
+-- Otherwise { max, restock (seconds), vendors = { names }, last = { name, left, at } }.
+function ns.VendorStock(source, itemId, faction, seen)
+    local data = ns.RawData and ns.RawData.vendorStock and ns.RawData.vendorStock[itemId] or nil
+    local observed = type(seen) == "table" and seen[itemId] or nil
+    if not data and type(observed) ~= "table" then return nil end
+    local result = { vendors = {} }
+    local function limitedAt(name, max, restock)
+        table.insert(result.vendors, name)
+        if max and (not result.max or max > result.max) then result.max = max end
+        if restock and restock > 0 and (not result.restock or restock < result.restock) then result.restock = restock end
+    end
+    local judged = {}
+    local function judge(name)
+        if judged[name] then return true end
+        judged[name] = true
+        local sight = type(observed) == "table" and observed[name] or nil
+        if type(sight) == "table" and type(sight.left) == "number" then
+            if sight.left < 0 then return false end
+            local known = data and data.limited[name] or nil
+            limitedAt(name, known and known.max or nil, known and known.restock or nil)
+            if not result.last or (sight.at or 0) > (result.last.at or 0) then
+                result.last = { name = name, left = sight.left, at = sight.at }
+            end
+        elseif data and data.limited[name] then
+            limitedAt(name, data.limited[name].max, data.limited[name].restock)
+        elseif data and contains(data.open, name) then
+            return false
+        end
+        return true
+    end
+    local stops = ns.VendorStops(source, faction)
+    for _, stop in ipairs(stops) do
+        if not judge(stop.name) then return nil end
+    end
+    -- Vendors the player has bought from that the text does not name.
+    if type(observed) == "table" then
+        for name in pairs(observed) do
+            if not judge(name) then return nil end
+        end
+    end
+    if #stops == 0 and #result.vendors == 0 and data and #(data.open or {}) == 0 then
+        -- The text names no vendor we can match; go by the item alone.
+        for name, limit in pairs(data.limited) do limitedAt(name, limit.max, limit.restock) end
+    end
+    if #result.vendors == 0 then return nil end
+    return result
+end
+
+local function duration(seconds)
+    if seconds >= 5400 then return string.format("%d hours", math.floor(seconds / 3600 + 0.5)) end
+    if seconds >= 3600 then return "1 hour" end
+    return string.format("%d minutes", math.max(1, math.floor(seconds / 60 + 0.5)))
+end
+
+-- One line describing a stock limit for the player.
+function ns.StockText(stock, now)
+    local text = "Limited stock"
+    if stock.max then text = text .. ": " .. stock.max .. " at a time" end
+    if stock.restock then text = text .. (stock.max and ", " or ": ") .. "about " .. duration(stock.restock) .. " to restock" end
+    text = text .. ". May be sold out or camped."
+    local last = stock.last
+    if last then
+        local ago = (type(now) == "number" and type(last.at) == "number" and now >= last.at) and (" " .. duration(now - last.at) .. " ago") or ""
+        if last.left == 0 then text = text .. " " .. last.name .. " was sold out when you looked" .. ago .. "."
+        else text = text .. " " .. last.name .. " had " .. last.left .. " when you looked" .. ago .. "." end
+    end
+    return text
+end
+
+local teachItems
+local function isTeachItem(itemId)
+    if not teachItems then
+        teachItems = {}
+        for _, recipe in ipairs(ns.RawData and ns.RawData.recipes or {}) do
+            for _, item in ipairs(recipe.teachItems or {}) do teachItems[item] = true end
+        end
+    end
+    return teachItems[itemId] == true
+end
+
+-- Called while a vendor window is open: remember how many of each recipe the vendor has.
+function ns.ScanMerchant()
+    if not ns.DB then return 0 end
+    local unitName, count, linkOf = rawget(_G, "UnitName"), rawget(_G, "GetMerchantNumItems"), rawget(_G, "GetMerchantItemLink")
+    if type(unitName) ~= "function" or type(count) ~= "function" or type(linkOf) ~= "function" then return 0 end
+    local okName, vendor = pcall(unitName, "npc")
+    local okCount, total = pcall(count)
+    if not okName or type(vendor) ~= "string" or vendor == "" or not okCount or type(total) ~= "number" then return 0 end
+    local frameApi, legacy, clock = rawget(_G, "C_MerchantFrame"), rawget(_G, "GetMerchantItemInfo"), rawget(_G, "time")
+    local now = type(clock) == "function" and clock() or nil
+    local recorded = 0
+    for index = 1, total do
+        local okLink, link = pcall(linkOf, index)
+        local itemId = okLink and type(link) == "string" and tonumber(string.match(link, "item:(%d+)")) or nil
+        if itemId and isTeachItem(itemId) then
+            local left
+            if type(frameApi) == "table" and type(frameApi.GetItemInfo) == "function" then
+                local ok, info = pcall(frameApi.GetItemInfo, index)
+                if ok and type(info) == "table" then left = info.numAvailable end
+            elseif type(legacy) == "function" then
+                local ok, _, _, _, _, available = pcall(legacy, index)
+                if ok then left = available end
+            end
+            if type(left) == "number" then
+                ns.DB.vendorSeen = ns.DB.vendorSeen or {}
+                ns.DB.vendorSeen[itemId] = ns.DB.vendorSeen[itemId] or {}
+                ns.DB.vendorSeen[itemId][vendor] = { left = left, at = now }
+                recorded = recorded + 1
+            end
+        end
+    end
+    if recorded > 0 and ns.UI and ns.UI.frame and ns.UI.frame:IsShown() then ns.RefreshUI() end
+    return recorded
 end

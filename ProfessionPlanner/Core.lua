@@ -141,6 +141,9 @@ function ns.NewContext(req, profile, prices)
         patterns = req.patterns == "buyable" and "buyable" or "known",
         ahPatterns = req.patterns == "buyable",
         vendorPatterns = req.vendorPatterns ~= false,
+        -- Vendor recipes sold one at a time are used unless the player turns them off.
+        avoidLimited = req.limitedPatterns == false,
+        seen = req.vendorSeen or (ns.DB and ns.DB.vendorSeen) or nil,
         faction = req.faction or (profile and profile.faction) or nil,
         cooldowns = req.cooldowns == true, stations = req.stations == true,
         discolored = req.discolored == true, useStock = req.useStock ~= false,
@@ -226,10 +229,13 @@ function ns.Explain(ctx, recipe)
     if #(recipe.teachItems or {}) == 0 or ns.TrainerTaught(recipe) then return { via = "trainer" }, nil end
     local bestItem, bestPrice, acquisition
     local vendorSold, vendorWhy = ns.VendorAccess(recipe.source, ctx.faction)
+    local limitedSkipped = false
     if ctx.vendorPatterns and vendorSold then
         for _, itemId in ipairs(recipe.teachItems) do
             local item = ctx.D["items"][itemId]
-            if item and (item.buy or 0) > 0 then
+            if ctx.avoidLimited and ns.VendorStock and ns.VendorStock(recipe.source, itemId, ctx.faction, ctx.seen) then
+                limitedSkipped = true
+            elseif item and (item.buy or 0) > 0 then
                 local price = item.buy / (item.stack or 1)
                 if not bestPrice or price < bestPrice then bestItem, bestPrice, acquisition = itemId, price, "Vendor" end
             end
@@ -242,6 +248,9 @@ function ns.Explain(ctx, recipe)
         end
     end
     if bestItem then return { via = "pattern", pattern = { bestItem, bestPrice }, acquisition = acquisition }, nil end
+    if limitedSkipped then
+        return nil, ctx.ahPatterns and "not on the AH; limited-stock vendor recipe (option off)" or "limited-stock vendor recipe (option off)"
+    end
     if ctx.ahPatterns then
         if vendorWhy then return nil, "not on the AH; " .. vendorWhy end
         if vendorSold and not ctx.vendorPatterns then return nil, "not on the AH (vendor recipes off)" end
@@ -532,6 +541,9 @@ local function buildPlanSingle(req, profile, prices)
             local pattern
             if item.patternItem then
                 pattern = { item = item.patternItem, name = ns.ItemName(ctx.D, item.patternItem), price = math.floor(item.patternCost + 0.5), src = item.availability.acquisition or "AH" }
+                if pattern.src == "Vendor" and ns.VendorStock then
+                    pattern.stock = ns.VendorStock(recipe.source, item.patternItem, ctx.faction, ctx.seen)
+                end
                 table.insert(patternRows, pattern)
             end
             local alternatives = {}
@@ -755,6 +767,8 @@ function ns.BuildRecipes(req, profile, prices)
             item = product and product.item or nil,
             mid = recipe.mid, grey = recipe.grey, via = availability and availability.via or nil, why = why,
             pattern = availability and availability.pattern and math.floor(availability.pattern[2] + 0.5) or nil,
+            limited = availability and availability.acquisition == "Vendor" and ns.VendorStock ~= nil
+                and ns.VendorStock(recipe.source, availability.pattern[1], ctx.faction, ctx.seen) ~= nil or nil,
             q = product and itemQuality(ctx.D, product.item) or 1,
             mats = buy ~= math.huge and math.floor(buy + 0.5) or nil,
             net = net ~= math.huge and math.floor(net + 0.5) or nil,

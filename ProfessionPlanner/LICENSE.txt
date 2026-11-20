@@ -47,3 +47,12 @@ The Software is provided "as is", without warranty of any kind.
 
 The positions describe the original game world and are matched to recipe
 vendors by name and zone; a vendor that WoW Forever has moved may be off.
+
+Vendor stock limits
+-------------------
+Which recipes vendors sell in limited numbers, and how long they take to
+restock, is taken from the CMaNGOS Classic world database -
+https://github.com/cmangos/classic-db - which is licensed under the GNU
+General Public License, version 3. That table (the `vendorStock` part of
+Data.lua) is offered under the same licence. It describes the original game;
+what the addon sees in vendor windows in WoW Forever takes precedence.

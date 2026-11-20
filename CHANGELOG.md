@@ -1,5 +1,11 @@
 # Changes
 
+## 1.4.0
+- Vendor recipes sold in limited numbers are marked, with the restock time and what the route costs without them.
+- "Limited stock" switch next to the tabs, to stop the route relying on those recipes.
+- The addon notes how many recipes a vendor had left whenever you open a vendor window; that overrides the built-in list.
+- "Clear pin" button; the map pin also clears when you open the pinned vendor's window.
+
 ## 1.3.0
 - "Show on map" button for recipes sold by vendors, with coordinates in the step text.
 - Vendor recipes / AH recipes switches next to the tabs.
