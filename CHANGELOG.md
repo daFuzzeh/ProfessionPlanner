@@ -1,5 +1,12 @@
 # Changes
 
+## 1.5.1
+- Shopping tab: shift-click an item with TradeSkillMaster's Browse tab open at the auction house to search for it.
+
+## 1.5.0
+- The open window follows what you do: skill gains, crafting, buying and learning recipes re-plan the route about a second later.
+- Profession levels are read from the game itself, so they are current and include professions TradeSkillMaster has not recorded yet.
+
 ## 1.4.2
 - The professions list shows only the selected character's professions, with a "Show all professions" button underneath.
 

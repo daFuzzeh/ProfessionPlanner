@@ -20,6 +20,7 @@ For auction prices, stock, gold and known recipes you need **TradeSkillMaster 4*
 - Recipes to buy are optional: switch vendor and auction-house recipes on or off and watch the cost change.
 - "Show on map" places the game's own map pin on the vendor that sells a recipe, for your faction.
 - Marks vendor recipes that are sold one at a time and are often sold out or camped, and can plan around them.
+- Updates as you craft, and searches TSM for a material when you shift-click it.
 - Names the next cheapest recipes for each step, for when a material is bought out.
 - A Profit tab for recipes that sell for more than their materials.
 

@@ -1,6 +1,6 @@
 local addonName, ns = ...
 
-ns.VERSION = "1.4.2"
+ns.VERSION = "1.5.1"
 
 -- Option keys that are restored from the saved variables. Character, profession and skill
 -- range are restored separately because they depend on who is logged in.
@@ -45,6 +45,39 @@ local function currentCharacter()
     return { name = name, first = first, realm = realm, realms = realms, faction = faction }
 end
 
+-- The logged-in character's profession levels straight from the game, which is always
+-- current; TSM's copy can lag behind while crafting. Names are matched in English.
+function ns.ReadLiveSkills()
+    local skills = {}
+    local count, info = rawget(_G, "GetNumSkillLines"), rawget(_G, "GetSkillLineInfo")
+    if type(count) ~= "function" or type(info) ~= "function" then return skills end
+    local ok, total = pcall(count)
+    if not ok or type(total) ~= "number" then return skills end
+    for index = 1, total do
+        local fine, name, _, _, rank, _, _, maxRank = pcall(info, index)
+        if fine and type(name) == "table" then name, rank, maxRank = name.name, name.rank, name.maxRank end
+        if fine and type(name) == "string" and type(rank) == "number" and ns.D and ns.D.by_prof[name] then
+            skills[name] = { level = rank, maxLevel = type(maxRank) == "number" and maxRank or 0 }
+        end
+    end
+    return skills
+end
+
+local function applyLiveSkills()
+    local profile = ns.profile
+    local char = profile and profile.currentId and profile.chars[profile.currentId] or nil
+    if not char then return end
+    for name, live in pairs(ns.ReadLiveSkills()) do
+        local known = char.profs[name]
+        if known then
+            known.level = live.level
+            if live.maxLevel > 0 then known.maxLevel = live.maxLevel end
+        else
+            char.profs[name] = { level = live.level, maxLevel = live.maxLevel }
+        end
+    end
+end
+
 -- Re-reads everything that comes from TSM. TSM keeps its saved-variable table live, so
 -- calling this when the window opens picks up current bags, bank, mail, gold and skill.
 function ns.RefreshTSM()
@@ -56,6 +89,7 @@ function ns.RefreshTSM()
     else
         ns.prices = nil
     end
+    if ns.D then applyLiveSkills() end
     return ns.profile, ns.prices
 end
 
@@ -117,14 +151,40 @@ function ns.Toggle()
     frame:Show()
 end
 
+-- Keep the open window in step with the game: skill gained, items crafted or bought, a
+-- recipe learned. Events come in bursts while crafting, so wait for a quiet moment and
+-- redraw once. Nothing is done while the window is closed; opening it reads everything.
+local updateQueued = false
+function ns.LiveUpdate()
+    if updateQueued then return end
+    local timer = rawget(_G, "C_Timer")
+    if type(timer) ~= "table" or type(timer.After) ~= "function" then return end
+    updateQueued = true
+    timer.After(1, function()
+        updateQueued = false
+        if not (ns.UI and ns.UI.frame and ns.UI.frame:IsShown()) then return end
+        if ns.DB and ns.DB.settings.liveUpdate == false then return end
+        ns.RefreshTSM()
+        ns.SyncRequest(false)
+        ns.liveRedraw = true
+        local ok, problem = pcall(ns.RefreshUI)
+        ns.liveRedraw = false
+        if not ok then error(problem, 0) end
+    end)
+end
+local LIVE_EVENTS = { SKILL_LINES_CHANGED = true, BAG_UPDATE_DELAYED = true, NEW_RECIPE_LEARNED = true, PLAYER_MONEY = true }
+
 local events = CreateFrame("Frame")
 events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
+for event in pairs(LIVE_EVENTS) do events:RegisterEvent(event) end
 events:RegisterEvent("MERCHANT_SHOW")
 events:RegisterEvent("MERCHANT_UPDATE")
 events:SetScript("OnEvent", function(_, event, name)
     if event == "ADDON_LOADED" then
         if name == addonName then ns.Initialize() end
+    elseif LIVE_EVENTS[event] then
+        if ns.DB then pcall(ns.LiveUpdate) end
     elseif event == "MERCHANT_SHOW" or event == "MERCHANT_UPDATE" then
         -- Never let a problem here interfere with the vendor window.
         pcall(ns.ScanMerchant)

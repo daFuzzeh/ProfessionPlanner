@@ -927,6 +927,51 @@ local function rowTick(ui, x, y, spell)
     return check
 end
 
+-- Shift-click on an item does what a shift-click on an item anywhere in the game does: it
+-- hands the item's link to whatever is listening. With TSM's Browse tab open at the auction
+-- house that starts an exact search for the item; with a chat box open it links the item.
+function ns.LinkItem(itemId, name)
+    if not itemId then return false end
+    local link
+    local info = rawget(_G, "GetItemInfo")
+    if type(info) == "function" then
+        local ok, _, found = pcall(info, itemId)
+        if ok and type(found) == "string" then link = found end
+    end
+    link = link or ("|cffffffff|Hitem:" .. itemId .. "::::::::|h[" .. tostring(name or itemId) .. "]|h|r")
+    local insert = rawget(_G, "ChatEdit_InsertLink")
+    local handled = false
+    if type(insert) == "function" then
+        local ok, result = pcall(insert, link)
+        handled = ok and result and true or false
+    end
+    if not handled then
+        local chat = rawget(_G, "DEFAULT_CHAT_FRAME")
+        if chat and chat.AddMessage then
+            chat:AddMessage("|cffffc842Profession Planner:|r nothing took the item. Open TradeSkillMaster's Browse tab at the auction house, then shift-click again.")
+        end
+    end
+    return handled
+end
+
+local function itemClick(self)
+    local shift = rawget(_G, "IsShiftKeyDown")
+    if type(shift) == "function" and shift() then ns.LinkItem(self.item, self.name) end
+end
+
+-- An invisible click area over an item's name.
+local function rowHit(ui, x, y, width, height, itemId, name)
+    local hit = acquire(ui, "hit", function()
+        local created = CreateFrame("Button", nil, ui.content)
+        created:SetScript("OnClick", itemClick)
+        return created
+    end)
+    hit:SetSize(width, height)
+    hit:SetPoint("TOPLEFT", ui.content, "TOPLEFT", x, y)
+    hit.item, hit.name = itemId, name
+    return hit
+end
+
 local function rowIcon(ui, x, y, size, itemId, name)
     local icon = acquire(ui, "icon", function()
         local created = CreateFrame("Button", nil, ui.content)
@@ -945,6 +990,7 @@ local function rowIcon(ui, x, y, size, itemId, name)
             local tip = rawget(_G, "GameTooltip")
             if tip then tip:Hide() end
         end)
+        created:SetScript("OnClick", itemClick)
         return created
     end)
     icon:SetSize(size, size)
@@ -1126,6 +1172,7 @@ local function renderShopping(ui, plan, y)
         local source = row.src or "no price"
         local sourceColour = source == "AH" and C.text or (source == "Vendor" and C.info or (source == "Own stock" and C.good or C.bad))
         put(ui, 40, y - 7, 262, row.name, 11, QUALITY[row.q or 1] or C.text)
+        rowHit(ui, 34, y - 2, 268, 22, row.item, row.name)
         put(ui, 306, y - 7, 52, tostring(row.need), 11, C.dim, "RIGHT")
         put(ui, 362, y - 7, 52, tostring(row.own), 11, row.own > 0 and C.good or C.faint, "RIGHT")
         put(ui, 418, y - 7, 56, tostring(row.buy), 12, row.buy > 0 and C.text or C.faint, "RIGHT")
@@ -1252,7 +1299,7 @@ function ns.RenderUI()
         if search == "" then
             ui.copyLabel:SetText("Nothing in this route needs the auction house.")
         else
-            ui.copyLabel:SetText("TSM Shopping: press Select buy list, then Ctrl+C, and paste into TSM's Shopping search. Each item stops at the quantity to buy.")
+            ui.copyLabel:SetText("Shift-click an item above to search for it in TSM (auction house open, Browse tab). For the whole list: Select buy list, Ctrl+C, paste into TSM's search.")
         end
         ui.copyBar:Show()
         view = view - COPY_H
@@ -1415,9 +1462,14 @@ function ns.RefreshUI()
         ui.status:SetText("Planning failed")
     end
     -- For recipes that may be sold out, say what going without would cost (a few at most).
+    -- These are extra plans, so a redraw caused by crafting reuses the last answers instead
+    -- of working them out again on every craft.
     local checked = 0
+    if not ns.liveRedraw or not ui.without then ui.without = {} end
     for _, step in ipairs(plan.steps) do
-        if step.type == "step" and step.pattern and step.pattern.stock and checked < 6 then
+        if step.type == "step" and step.pattern and step.pattern.stock and ui.without[step.spell] then
+            step.without = ui.without[step.spell]
+        elseif step.type == "step" and step.pattern and step.pattern.stock and checked < 6 then
             checked = checked + 1
             local without = copyTable(request)
             without.exclude = copyTable(request.exclude)
@@ -1429,6 +1481,7 @@ function ns.RefreshUI()
                 local extra = other.summary.net - plan.summary.net
                 step.without = extra > 0 and ("Without it the route costs " .. ns.Coins(extra) .. " more.") or "The route costs no more without it."
             end
+            ui.without[step.spell] = step.without
         end
     end
     ui.currentPlan = plan
