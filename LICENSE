@@ -48,11 +48,19 @@ The Software is provided "as is", without warranty of any kind.
 The positions describe the original game world and are matched to recipe
 vendors by name and zone; a vendor that WoW Forever has moved may be off.
 
-Vendor stock limits
--------------------
+Vendor stock limits and rank trainers
+-------------------------------------
 Which recipes vendors sell in limited numbers, and how long they take to
 restock, is taken from the CMaNGOS Classic world database -
 https://github.com/cmangos/classic-db - which is licensed under the GNU
-General Public License, version 3. That table (the `vendorStock` part of
-Data.lua) is offered under the same licence. It describes the original game;
+General Public License, version 3. Which trainers teach each profession rank
+comes from the same database. Those tables (the `vendorStock` and
+`rankTrainers` parts of Data.lua) are offered under the same licence. It describes the original game;
 what the addon sees in vendor windows in WoW Forever takes precedence.
+
+Dungeon entrances
+-----------------
+The positions of dungeon entrances used by the travel arrow (the `dungeons`
+part of TravelData.lua) are taken from the same CMaNGOS Classic world
+database and are offered under the GNU General Public License, version 3.
+They describe the original game world.

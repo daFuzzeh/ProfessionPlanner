@@ -23,6 +23,8 @@ For auction prices, stock, gold and known recipes you need **TradeSkillMaster 4*
 - Updates as you craft, and searches TSM for a material when you shift-click it.
 - Names the next cheapest recipes for each step, for when a material is bought out.
 - A Profit tab for recipes that sell for more than their materials.
+- Names the trainers who teach the next profession rank, and keeps a Stats tab of crafts, skill points and cost.
+- Travel arrow: `/pp go <place>`, a map pin or "Show on map" plans the way from where you stand over flight paths you know, boats and zeppelins, and leads you along a trail around mountains and along roads. You do all the moving. This part is new and has had almost no time in the game.
 
 More detail is in [ProfessionPlanner/README.md](ProfessionPlanner/README.md).
 
@@ -32,4 +34,4 @@ Open an [issue](../../issues) and include: the addon version (shown next to the 
 
 ## Credits and licence
 
-MIT licence. Recipe acquisition text is from [Classic WoW Forever](https://classicwowforever.com/) (CC BY 4.0). Vendor map positions are from the [pfQuest](https://github.com/shagu/pfQuest) database by Shagu (MIT). Vendor stock limits are from the [CMaNGOS Classic database](https://github.com/cmangos/classic-db) (GPL-3.0); that one table is offered under GPL-3.0. See [LICENSE](LICENSE). Not affiliated with Blizzard Entertainment or TradeSkillMaster.
+MIT licence. Recipe acquisition text is from [Classic WoW Forever](https://classicwowforever.com/) (CC BY 4.0). Vendor map positions are from the [pfQuest](https://github.com/shagu/pfQuest) database by Shagu (MIT). Vendor stock limits, rank trainers and dungeon entrances are from the [CMaNGOS Classic database](https://github.com/cmangos/classic-db) (GPL-3.0); those tables are offered under GPL-3.0. See [LICENSE](LICENSE). Not affiliated with Blizzard Entertainment or TradeSkillMaster.

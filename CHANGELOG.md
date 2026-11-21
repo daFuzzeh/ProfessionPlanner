@@ -1,5 +1,27 @@
 # Changes
 
+## 1.10.0
+- Travel remembers where you walk (not on flights, boats or lifts) and uses those paths for later trips, to cover cities, bridges and tunnels the terrain data does not show. `/pp record` shows how much is recorded, `/pp record off` stops it. It stays in the saved settings on your PC.
+
+## 1.9.1
+- Trails for Kalimdor and Zephras Isle.
+
+## 1.9.0
+- The travel arrow follows a trail worked out from the game's terrain and roads instead of pointing straight at the goal, and the box says how far and which way to the next bend and what to do there.
+- No trail inside Undercity, Stormwind or Ironforge, nor across bridges or through tunnels: there the box says so and the arrow points straight.
+
+## 1.8.1
+- Fixed: travel sent you to a flight master in the city you were already standing in.
+
+## 1.8.0
+- Travel arrow: **Show on map**, a map pin of your own, or `/pp go <place>` plans the way from where you stand: walk, flight paths you have learned, boats and zeppelins. A small movable box shows the steps and an arrow. You do all the moving.
+
+## 1.7.0
+- Stats tab: crafts, skill points, cost and luck per character and profession, for the session and all time.
+
+## 1.6.0
+- At a skill cap the route names the trainers who teach the next rank for your faction, with a map button.
+
 ## 1.5.1
 - Shopping tab: shift-click an item with TradeSkillMaster's Browse tab open at the auction house to search for it.
 

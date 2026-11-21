@@ -1,13 +1,18 @@
 ## Interface: 16001
 ## Title: Profession Planner
-## Notes: Cheapest Forever profession routes, TSM shopping lists and recipe locations.
+## Notes: Cheapest Forever profession routes, TSM shopping lists, recipe locations and a travel arrow.
 ## Author: Profession Planner contributors
-## Version: 1.5.1
+## Version: 1.10.0
 ## OptionalDeps: TradeSkillMaster
 ## SavedVariables: ProfessionPlannerDB
 Data.lua
 Core.lua
 TSM.lua
 Map.lua
+TravelData.lua
+TravelPaths.lua
+Paths.lua
+Travel.lua
+Stats.lua
 UI.lua
 Init.lua

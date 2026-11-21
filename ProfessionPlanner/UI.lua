@@ -7,7 +7,7 @@ local addonName, ns = ...
 
 local PROFESSIONS = { "Alchemy", "Blacksmithing", "Enchanting", "Engineering", "Leatherworking", "Tailoring", "Cooking", "First Aid", "Mining" }
 local SECONDARY = { Cooking = true, ["First Aid"] = true, Fishing = true }
-local TABS = { "Route", "Shopping", "Recipes", "Profit" }
+local TABS = { "Route", "Shopping", "Recipes", "Profit", "Stats" }
 local ICONS = "Interface\\Icons\\"
 local PROFESSION_ICON = {
     Alchemy = "Trade_Alchemy", Blacksmithing = "Trade_BlackSmithing", Enchanting = "Trade_Engraving",
@@ -684,7 +684,7 @@ local function buildControls(ui, frame)
     ui.tabs = {}
     local x = MAIN_X
     for _, name in ipairs(TABS) do
-        local tab = W.button(frame, name, 92, 28, "ghost", function() ns.ShowTab(name) end)
+        local tab = W.button(frame, name, 74, 28, "ghost", function() ns.ShowTab(name) end)
         tab:SetPoint("TOPLEFT", x, -HEADER_H - 150)
         tab.under = tab:CreateTexture(nil, "ARTWORK")
         tab.under:SetColorTexture(C.accent[1], C.accent[2], C.accent[3], 1)
@@ -693,7 +693,7 @@ local function buildControls(ui, frame)
         tab.under:SetHeight(2)
         W.font(tab.label, 12)
         ui.tabs[name] = tab
-        x = x + 96
+        x = x + 77
     end
     -- Which recipes the route may buy: the options changed most often, so they sit here
     -- as well as in the Options panel.
@@ -1001,10 +1001,11 @@ local function rowIcon(ui, x, y, size, itemId, name)
 end
 
 -- A full-width message with a coloured bar down its left edge.
-local function banner(ui, y, value, colour)
+local function banner(ui, y, value, colour, reserve)
     local bg = block(ui, "bg", 0, y, CONTENT_W, 10, colour, 0.10)
     local bar = block(ui, "art", 0, y, 3, 10, colour, 1)
-    local height = put(ui, 14, y - 8, CONTENT_W - 28, value, 11, C.text, "LEFT", true) + 16
+    local height = put(ui, 14, y - 8, CONTENT_W - 28 - (reserve or 0), value, 11, C.text, "LEFT", true) + 16
+    if reserve then height = math.max(height, 34) end
     bg:SetHeight(height)
     bar:SetHeight(height)
     return y - height - 6
@@ -1048,7 +1049,31 @@ local function renderRoute(ui, plan, y)
     local steps = 0
     for _, step in ipairs(plan.steps) do
         if step.type == "note" then
-            y = banner(ui, y, "Trainer: " .. step.text, C.accent)
+            -- Already trained past this cap: nothing to say.
+            local char = ns.profile and ns.profile.chars[request.char] or nil
+            local mine = char and char.profs and char.profs[request.prof] or nil
+            local trained = mine and step.at and (tonumber(mine.maxLevel) or 0) > step.at
+            if not trained then
+                local faction = ns.profile and ns.profile.faction
+                local cap = step.at or 0
+                local trainers = ns.SortStops(ns.RankTrainers(request.prof, cap, faction))
+                local text = "Trainer: " .. step.text
+                if #trainers > 0 then
+                    local named = {}
+                    for index = 1, math.min(4, #trainers) do table.insert(named, ns.StopText(trainers[index])) end
+                    text = text .. "\nTaught by: " .. table.concat(named, "; ")
+                        .. (#trainers > 4 and (" and " .. (#trainers - 4) .. " more") or "") .. "."
+                        .. "\nNot every trainer teaches this rank, whatever their title says."
+                    local pinned = ns.pinned and ns.pinned.source == ("trainer:" .. request.prof .. ":" .. cap)
+                    local top = y
+                    y = banner(ui, y, text, C.accent, pinned and 190 or 112)
+                    local prof = request.prof
+                    rowButton(ui, CONTENT_W - 108, top - 6, "Show on map", function() ns.ShowTrainer(prof, cap, faction) end, 96)
+                    if pinned then rowButton(ui, CONTENT_W - 186, top - 6, "Clear pin", function() ns.ClearPin() end, 72) end
+                else
+                    y = banner(ui, y, text, C.accent)
+                end
+            end
         else
             steps = steps + 1
             local top = y
@@ -1277,7 +1302,105 @@ local function renderProfit(ui, plan, y)
     return y
 end
 
-local RENDERERS = { Route = renderRoute, Shopping = renderShopping, Recipes = renderRecipes, Profit = renderProfit }
+local STATS_COLUMNS = {
+    { title = "", x = 10, w = 100 }, { title = "POINTS", x = 114, w = 60, right = true }, { title = "CRAFTS", x = 178, w = 60, right = true },
+    { title = "MATERIALS USED", x = 242, w = 100, right = true }, { title = "SELL-BACK", x = 346, w = 96, right = true },
+    { title = "NET COST", x = 446, w = 90, right = true }, { title = "PER POINT", x = 540, w = 84, right = true },
+    { title = "ON AVERAGE", x = 628, w = 84, right = true }, { title = "LUCK", x = 716, w = 84, right = true },
+}
+local STATS_RECIPES = {
+    { title = "RECIPE (ALL TIME)", x = 40, w = 256 }, { title = "CRAFTS", x = 300, w = 60, right = true }, { title = "POINTS", x = 364, w = 60, right = true },
+    { title = "EXPECTED", x = 428, w = 80, right = true }, { title = "LUCK", x = 512, w = 70, right = true },
+    { title = "NET COST", x = 586, w = 100, right = true }, { title = "PER POINT", x = 690, w = 110, right = true },
+}
+
+local function luckText(luck)
+    if not luck then return "-", C.faint end
+    local percent = math.floor(luck * 100 + 0.5)
+    return percent .. "%", (percent >= 100 and C.good) or (percent < 80 and C.warn) or C.text
+end
+
+local resetArmed
+local function renderStats(ui, plan, y)
+    local request = ns.request
+    local char, prof = request.char or ns.StatsCharacter(), request.prof
+    local session, total = ns.StatsFor(char, prof)
+    local mine = char == ns.StatsCharacter()
+    if not total and not session then
+        resetArmed = nil
+        return banner(ui, y, "Nothing tracked yet for " .. prof .. " on this character.\n"
+            .. (mine and "Craft something and the numbers appear here. Tracking runs whether or not this window is open."
+                or "Tracking only counts the character you are logged in on."), C.info)
+    end
+    local top = y
+    y = banner(ui, y, "What your crafting actually cost. Gold is the value of the materials used and of what was made, at prices when crafted; recipes bought and training fees are not counted."
+        .. "\nOn average: the cost per point with average luck. Luck: points gained against the average for those crafts; under 100% means an unlucky run.", C.info, 232)
+    local armed = resetArmed == char .. "/" .. prof
+    rowButton(ui, CONTENT_W - 222, top - 6, "Reset session", function()
+        resetArmed = nil
+        ns.ResetStats(char, prof, "session")
+        ns.RenderUI()
+    end, 96)
+    rowButton(ui, CONTENT_W - 120, top - 6, armed and "Click to confirm" or "Reset all", function()
+        if armed then
+            resetArmed = nil
+            ns.ResetStats(char, prof, "all")
+        else
+            resetArmed = char .. "/" .. prof
+        end
+        ns.RenderUI()
+    end, 108)
+    y = heading(ui, y, STATS_COLUMNS)
+    local index = 0
+    for _, entry in ipairs({ { "This session", session }, { "All time", total } }) do
+        local record = entry[2]
+        if record then
+            index = index + 1
+            stripe(ui, y, 26, index)
+            local net, per, planned, luck = ns.StatsFigures(record)
+            local luckLabel, luckColour = luckText(luck)
+            put(ui, 10, y - 7, 100, entry[1], 11, C.text)
+            put(ui, 114, y - 7, 60, tostring(record.points), 11, C.text, "RIGHT")
+            put(ui, 178, y - 7, 60, tostring(record.crafts), 11, C.dim, "RIGHT")
+            put(ui, 242, y - 7, 100, ns.Coins(record.mats), 11, C.dim, "RIGHT")
+            put(ui, 346, y - 7, 96, ns.Coins(record.back), 11, C.dim, "RIGHT")
+            put(ui, 446, y - 7, 90, ns.Coins(net), 11, C.text, "RIGHT")
+            put(ui, 540, y - 7, 84, per and ns.Coins(per) or "-", 11, C.accent, "RIGHT")
+            put(ui, 628, y - 7, 84, planned and ns.Coins(planned) or "-", 11, C.dim, "RIGHT")
+            put(ui, 716, y - 7, 84, luckLabel, 11, luckColour, "RIGHT")
+            y = y - 26
+        end
+    end
+    local rows = {}
+    for spell, record in pairs(total and total.recipes or {}) do
+        if type(record) == "table" then table.insert(rows, { spell = spell, record = record }) end
+    end
+    if #rows == 0 then return y end
+    table.sort(rows, function(a, b)
+        if a.record.crafts ~= b.record.crafts then return a.record.crafts > b.record.crafts end
+        return a.spell < b.spell
+    end)
+    y = heading(ui, y - 14, STATS_RECIPES)
+    for position, entry in ipairs(rows) do
+        local record, recipe = entry.record, ns.RecipeBySpell(entry.spell)
+        local net, per, _, luck = ns.StatsFigures(record)
+        local luckLabel, luckColour = luckText(luck)
+        local product = recipe and recipe.products and recipe.products[1] and recipe.products[1].item or nil
+        stripe(ui, y, 26, position)
+        if product then rowIcon(ui, 10, y - 3, 20, product, recipe.name) end
+        put(ui, 40, y - 7, 256, recipe and recipe.name or ("Spell " .. tostring(entry.spell)), 11, C.text)
+        put(ui, 300, y - 7, 60, tostring(record.crafts), 11, C.dim, "RIGHT")
+        put(ui, 364, y - 7, 60, tostring(record.points), 11, C.text, "RIGHT")
+        put(ui, 428, y - 7, 80, string.format("%.1f", record.expected), 11, C.dim, "RIGHT")
+        put(ui, 512, y - 7, 70, luckLabel, 11, luckColour, "RIGHT")
+        put(ui, 586, y - 7, 100, ns.Coins(net), 11, C.dim, "RIGHT")
+        put(ui, 690, y - 7, 110, per and ns.Coins(per) or "-", 11, C.accent, "RIGHT")
+        y = y - 26
+    end
+    return y
+end
+
+local RENDERERS = { Route = renderRoute, Shopping = renderShopping, Recipes = renderRecipes, Profit = renderProfit, Stats = renderStats }
 
 function ns.RenderUI()
     local ui = ns.UI

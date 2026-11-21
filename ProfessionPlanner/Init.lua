@@ -1,6 +1,6 @@
 local addonName, ns = ...
 
-ns.VERSION = "1.5.1"
+ns.VERSION = "1.10.0"
 
 -- Option keys that are restored from the saved variables. Character, profession and skill
 -- range are restored separately because they depend on who is logged in.
@@ -179,12 +179,23 @@ events:RegisterEvent("ADDON_LOADED")
 events:RegisterEvent("PLAYER_LOGIN")
 for event in pairs(LIVE_EVENTS) do events:RegisterEvent(event) end
 events:RegisterEvent("MERCHANT_SHOW")
+events:RegisterEvent("TRAINER_SHOW")
 events:RegisterEvent("MERCHANT_UPDATE")
-events:SetScript("OnEvent", function(_, event, name)
+-- Tracking. Registered one by one so a client without one of them still loads the addon.
+for _, event in ipairs({ "UNIT_SPELLCAST_SUCCEEDED", "CHAT_MSG_SKILL" }) do pcall(events.RegisterEvent, events, event) end
+events:SetScript("OnEvent", function(_, event, name, second, third)
     if event == "ADDON_LOADED" then
         if name == addonName then ns.Initialize() end
+    elseif event == "UNIT_SPELLCAST_SUCCEEDED" then
+        -- (unit, cast id, spell id); tracking must never get in the way of a cast.
+        if name == "player" then pcall(ns.RecordCraft, type(third) == "number" and third or second) end
+    elseif event == "CHAT_MSG_SKILL" then
+        pcall(ns.ScanSkills)
     elseif LIVE_EVENTS[event] then
+        if event == "SKILL_LINES_CHANGED" then pcall(ns.ScanSkills) end
         if ns.DB then pcall(ns.LiveUpdate) end
+    elseif event == "TRAINER_SHOW" then
+        pcall(ns.ArrivedAtVendor)
     elseif event == "MERCHANT_SHOW" or event == "MERCHANT_UPDATE" then
         -- Never let a problem here interfere with the vendor window.
         pcall(ns.ScanMerchant)
@@ -197,10 +208,15 @@ events:SetScript("OnEvent", function(_, event, name)
             ns.RefreshTSM()
             restoreRequest()
         end
+        pcall(ns.ScanSkills)
     end
 end)
 
 SLASH_PROFESSIONPLANNER1 = "/pp"
 SLASH_PROFESSIONPLANNER2 = "/profplan"
 SLASH_PROFESSIONPLANNER3 = "/professionplanner"
-SlashCmdList.PROFESSIONPLANNER = function() ns.Toggle() end
+SlashCmdList.PROFESSIONPLANNER = function(message)
+    -- "/pp go <place>" and "/pp stop" belong to the travel arrow; anything else opens the window.
+    if type(message) == "string" and message ~= "" and ns.Travel and ns.Travel.Slash(message) then return end
+    ns.Toggle()
+end

@@ -95,7 +95,7 @@ local function continentOf(mapId)
 end
 
 -- Order the stops so the one in the player's zone comes first, then ones on the same
--- continent, then the rest.
+-- continent, then the rest; a zone the game has no map for goes last.
 function ns.SortStops(stops)
     local maps = rawget(_G, "C_Map")
     local here
@@ -107,7 +107,7 @@ function ns.SortStops(stops)
     local ranked = {}
     for index, stop in ipairs(stops) do
         local mapId = ns.FindMap(stop.zone)
-        local rank = 3
+        local rank = mapId and 3 or 4
         if mapId and mapId == here then rank = 1
         elseif mapId and continent and continentOf(mapId) == continent then rank = 2 end
         table.insert(ranked, { stop = stop, rank = rank, index = index })
@@ -185,6 +185,8 @@ function ns.ShowStop(stop, another)
     end
     -- Remember our pin so it can be removed again, by the button or on reaching the vendor.
     if pinned then ns.pinned = { name = stop.name, zone = stop.zone, map = mapId, x = stop.x / 100, y = stop.y / 100 } end
+    -- Point the travel arrow at it too; a problem there must not cost the player the pin.
+    if stop.x and ns.Travel then pcall(ns.Travel.GoTo, mapId, stop.x / 100, stop.y / 100, stop.name) end
     local open = rawget(_G, "OpenWorldMap")
     if type(open) == "function" then pcall(open, mapId) end
     local message
@@ -199,8 +201,8 @@ end
 -- "Show on map" for a recipe: the nearest usable vendor first; each further click moves on
 -- to the next one.
 local lastSource, lastIndex
-function ns.ShowVendor(source, faction)
-    local stops = ns.SortStops(ns.VendorStops(source, faction))
+function ns.ShowVendor(source, faction, given)
+    local stops = ns.SortStops(given or ns.VendorStops(source, faction))
     if #stops == 0 then return nil end
     if lastSource == source then lastIndex = lastIndex % #stops + 1 else lastSource, lastIndex = source, 1 end
     local stop = stops[lastIndex]
@@ -336,4 +338,25 @@ function ns.ScanMerchant()
     end
     if recorded > 0 and ns.UI and ns.UI.frame and ns.UI.frame:IsShown() then ns.RefreshUI() end
     return recorded
+end
+
+-- Rank trainers ---------------------------------------------------------------
+-- Not every trainer teaches every rank, and the title does not say which: an "Expert
+-- Alchemist" teaches Journeyman only. `cap` is the skill cap the rank lifts (75, 150, 225).
+-- Returns the trainers this faction can use, as map stops.
+function ns.RankTrainers(profession, cap, faction)
+    local stops = {}
+    local data = ns.RawData and ns.RawData.rankTrainers and ns.RawData.rankTrainers[profession] or nil
+    local mine = (faction == "Horde" and "H") or (faction == "Alliance" and "A") or nil
+    for _, trainer in ipairs(data and data[cap] or {}) do
+        local side = trainer.fac or ""
+        if not mine or side == "" or string.find(side, mine, 1, true) then
+            table.insert(stops, { name = trainer.name, zone = trainer.zone, x = trainer.x, y = trainer.y, title = trainer.title })
+        end
+    end
+    return stops
+end
+
+function ns.ShowTrainer(profession, cap, faction)
+    return ns.ShowVendor("trainer:" .. profession .. ":" .. cap, faction, ns.RankTrainers(profession, cap, faction))
 end
