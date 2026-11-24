@@ -273,10 +273,14 @@ function ns.VendorStock(source, itemId, faction, seen)
     return result
 end
 
+local function plural(number, word)
+    return number .. " " .. word .. (number == 1 and "" or "s")
+end
+
 local function duration(seconds)
-    if seconds >= 5400 then return string.format("%d hours", math.floor(seconds / 3600 + 0.5)) end
+    if seconds >= 5400 then return plural(math.floor(seconds / 3600 + 0.5), "hour") end
     if seconds >= 3600 then return "1 hour" end
-    return string.format("%d minutes", math.max(1, math.floor(seconds / 60 + 0.5)))
+    return plural(math.max(1, math.floor(seconds / 60 + 0.5)), "minute")
 end
 
 -- One line describing a stock limit for the player.
@@ -338,6 +342,114 @@ function ns.ScanMerchant()
     end
     if recorded > 0 and ns.UI and ns.UI.frame and ns.UI.frame:IsShown() then ns.RefreshUI() end
     return recorded
+end
+
+-- Whether the trainer window shows the recipes the player can learn now. A window that hides
+-- them lists less than the trainer teaches, so then nothing may be concluded from what is
+-- missing. A client without the call has no such filter; a call that fails cannot be trusted.
+local function availableShown()
+    local filter = rawget(_G, "GetTrainerServiceTypeFilter")
+    if type(filter) ~= "function" then return true end
+    local ok, shown = pcall(filter, "available")
+    if not ok then return false end
+    return shown == true or (type(shown) == "number" and shown ~= 0)
+end
+
+-- Profession -> skill of the character being played, as the game reports it now (TSM's copy
+-- can lag behind).
+local function playedSkills()
+    local skills = {}
+    local profile = ns.profile
+    local char = profile and profile.currentId and profile.chars and profile.chars[profile.currentId] or nil
+    for name, prof in pairs(char and char.profs or {}) do
+        if type(prof) == "table" and type(prof.level) == "number" then skills[name] = prof.level end
+    end
+    if type(ns.ReadLiveSkills) == "function" then
+        for name, live in pairs(ns.ReadLiveSkills()) do skills[name] = live.level end
+    end
+    return skills
+end
+
+-- Called while a trainer window is open: read the skill each recipe is taught at. The game is
+-- the only place that knows it, so this replaces the shipped rank from then on. A trainer that
+-- lists the profession's recipes but not one the planner counted on is noted too.
+function ns.ScanTrainer()
+    if not ns.DB or not ns.D then return 0 end
+    local count, infoOf, needOf = rawget(_G, "GetNumTrainerServices"), rawget(_G, "GetTrainerServiceInfo"), rawget(_G, "GetTrainerServiceSkillReq")
+    if type(count) ~= "function" or type(infoOf) ~= "function" or type(needOf) ~= "function" then return 0 end
+    local okCount, total = pcall(count)
+    if not okCount or type(total) ~= "number" then return 0 end
+    -- `listed` is every service in the window; `services` those that ask for a skill.
+    local listed, services = {}, {}
+    for index = 1, total do
+        local okInfo, name, _, category = pcall(infoOf, index)
+        if okInfo and type(name) == "string" and category ~= "header" then
+            local okNeed, skill, rank = pcall(needOf, index)
+            local line = { name = name }
+            if okNeed and type(skill) == "string" then line.skill = skill end
+            table.insert(listed, line)
+            if okNeed and type(skill) == "string" and type(rank) == "number" then
+                table.insert(services, { name = name, skill = skill, rank = rank })
+            end
+        end
+    end
+    if #listed == 0 then return 0 end
+    local unitName, clock = rawget(_G, "UnitName"), rawget(_G, "time")
+    local npc
+    if type(unitName) == "function" then
+        local ok, who = pcall(unitName, "npc")
+        if ok and type(who) == "string" and who ~= "" then npc = who end
+    end
+    local now = type(clock) == "function" and clock() or nil
+    local name = npc or "This trainer"
+    local fresh, differ, changed = 0, 0, {}
+    if #services > 0 then
+        if type(ns.DB.trainerRanks) ~= "table" then ns.DB.trainerRanks = {} end
+        fresh, differ, changed = ns.RecordTrainerRanks(ns.DB.trainerRanks, services, npc, now)
+        if fresh > 0 then ns.ApplyTrainerRanks(ns.DB.trainerRanks) end
+    end
+    if type(ns.DB.trainerMissing) ~= "table" then ns.DB.trainerMissing = {} end
+    local added, cleared = ns.RecordTrainerMissing(ns.DB.trainerMissing, listed, npc, playedSkills(), ns.PlayedKnows, now, availableShown())
+    if fresh > 0 then
+        if differ == 0 then
+            say("read " .. fresh .. (fresh == 1 and " learn rank" or " learn ranks") .. " from " .. (npc or "this trainer") .. ".")
+        else
+            local parts = {}
+            for index = 1, math.min(3, #changed) do
+                local change = changed[index]
+                table.insert(parts, change.name .. " from skill " .. change.rank .. (change.was and (", not " .. change.was) or ""))
+            end
+            say(name .. " teaches " .. table.concat(parts, "; ") .. (#changed > 3 and ("; and " .. (#changed - 3) .. " more") or "")
+                .. ". Routes now use that.")
+        end
+    end
+    -- One line for each profession whose recipes a trainer did not offer.
+    local byProfession, order = {}, {}
+    for _, recipe in ipairs(added) do
+        if not byProfession[recipe.prof] then
+            byProfession[recipe.prof] = {}
+            table.insert(order, recipe.prof)
+        end
+        table.insert(byProfession[recipe.prof], recipe)
+    end
+    for _, prof in ipairs(order) do
+        local recipes = byProfession[prof]
+        table.sort(recipes, function(a, b)
+            if a.learn ~= b.learn then return a.learn < b.learn end
+            return a.name < b.name
+        end)
+        local names = {}
+        for _, recipe in ipairs(recipes) do table.insert(names, recipe.name) end
+        local many = #recipes > 1
+        say(name .. " does not teach " .. ns.NameList(names) .. " at your skill (" .. ns.DB.trainerMissing[recipes[1].spell].skill .. "). "
+            .. (many and "They are" or "It is") .. " out of your routes until a trainer lists " .. (many and "them" or "it") .. ".")
+    end
+    -- The lines above already say why these recipes moved; the kept route must not say it a second time.
+    ns.routeExplained = ns.routeExplained or {}
+    for _, change in ipairs(changed) do ns.routeExplained[change.spell] = true end
+    for _, recipe in ipairs(added) do ns.routeExplained[recipe.spell] = true end
+    if (fresh > 0 or #added > 0 or cleared > 0) and ns.UI and ns.UI.frame and ns.UI.frame:IsShown() then ns.RefreshUI() end
+    return fresh
 end
 
 -- Rank trainers ---------------------------------------------------------------

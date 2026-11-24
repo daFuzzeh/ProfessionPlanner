@@ -31,6 +31,19 @@ The acquisition text is redistributed with attribution. No endorsement by
 Classic WoW Forever is implied. World of Warcraft and TradeSkillMaster are
 properties of their respective owners; this addon is not affiliated with them.
 
+Trainer learn ranks
+-------------------
+The skill a trainer asks before teaching a recipe is decided by the server.
+For 78 recipes the rank shipped here is the one ForeverWowCraft -
+https://foreverwowcraft.com/ - reports as seen at a trainer in WoW Forever
+(its route pages, read on 23 November 2026). Those ranks are marked
+unconfirmed in the addon. For 121 more Blacksmithing, Leatherworking and
+Tailoring recipes the rank is the trainer rank given in the Classic WoW
+Forever acquisition text (credited above), where it is the lower one; those
+are marked unconfirmed too. A rank the addon reads from a trainer's window in
+your own game replaces the shipped one. No endorsement by ForeverWowCraft is
+implied.
+
 Vendor map positions
 --------------------
 pfQuest database by Shagu - https://github.com/shagu/pfQuest

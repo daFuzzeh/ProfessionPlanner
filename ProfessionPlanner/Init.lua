@@ -1,6 +1,6 @@
 local addonName, ns = ...
 
-ns.VERSION = "1.10.0"
+ns.VERSION = "1.12.1"
 
 -- Option keys that are restored from the saved variables. Character, profession and skill
 -- range are restored separately because they depend on who is logged in.
@@ -131,9 +131,13 @@ function ns.Initialize()
     if type(saved) ~= "table" then saved = {} end
     if type(saved.settings) ~= "table" then saved.settings = {} end
     if type(saved.ticks) ~= "table" then saved.ticks = {} end
+    if type(saved.trainerRanks) ~= "table" then saved.trainerRanks = {} end
+    if type(saved.trainerMissing) ~= "table" then saved.trainerMissing = {} end
     ProfessionPlannerDB = saved
     ns.DB = saved
     if not ns.D then ns.PrepareData() end
+    -- Learn ranks read from trainer windows in earlier sessions go over the shipped ones.
+    ns.ApplyTrainerRanks(saved.trainerRanks)
     ns.RefreshTSM()
     restoreRequest()
 end
@@ -182,7 +186,7 @@ events:RegisterEvent("MERCHANT_SHOW")
 events:RegisterEvent("TRAINER_SHOW")
 events:RegisterEvent("MERCHANT_UPDATE")
 -- Tracking. Registered one by one so a client without one of them still loads the addon.
-for _, event in ipairs({ "UNIT_SPELLCAST_SUCCEEDED", "CHAT_MSG_SKILL" }) do pcall(events.RegisterEvent, events, event) end
+for _, event in ipairs({ "UNIT_SPELLCAST_SUCCEEDED", "CHAT_MSG_SKILL", "TRAINER_UPDATE" }) do pcall(events.RegisterEvent, events, event) end
 events:SetScript("OnEvent", function(_, event, name, second, third)
     if event == "ADDON_LOADED" then
         if name == addonName then ns.Initialize() end
@@ -193,9 +197,14 @@ events:SetScript("OnEvent", function(_, event, name, second, third)
         pcall(ns.ScanSkills)
     elseif LIVE_EVENTS[event] then
         if event == "SKILL_LINES_CHANGED" then pcall(ns.ScanSkills) end
+        -- (recipe spell id, ...): known from now on, before TradeSkillMaster has seen it.
+        if event == "NEW_RECIPE_LEARNED" then pcall(ns.NoteLearned, name) end
         if ns.DB then pcall(ns.LiveUpdate) end
-    elseif event == "TRAINER_SHOW" then
-        pcall(ns.ArrivedAtVendor)
+    elseif event == "TRAINER_SHOW" or event == "TRAINER_UPDATE" then
+        -- The list can arrive after the window opens, so read it on both. Never let a problem
+        -- here interfere with the trainer window.
+        pcall(ns.ScanTrainer)
+        if event == "TRAINER_SHOW" then pcall(ns.ArrivedAtVendor) end
     elseif event == "MERCHANT_SHOW" or event == "MERCHANT_UPDATE" then
         -- Never let a problem here interfere with the vendor window.
         pcall(ns.ScanMerchant)

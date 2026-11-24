@@ -192,7 +192,25 @@ function ns.ToggleAvoid(spell)
     end
     if found then table.remove(ns.request.exclude, found) else table.insert(ns.request.exclude, spell) end
     if ns.DB then ns.DB.settings.exclude = copyTable(ns.request.exclude) end
-    ns.RefreshUI()
+    -- Avoiding a recipe re-chooses only its stretch of the kept route; allowing one again plans afresh.
+    if found then ns.freshPlan = true else ns.quietBreak = true end
+    local ok, problem = pcall(ns.RefreshUI)
+    ns.quietBreak = nil
+    if not ok then error(problem, 0) end
+end
+
+-- The route is chosen when the player asks for a plan and is then kept: what is bought, crafted or gained
+-- afterwards moves the counts and the costs, not the recipes. (Buying the shopping list used to reshuffle the
+-- route, because everything in the bags counts as free.) The kept route belongs to one character, profession,
+-- target and set of options: change any of those, or press Plan, and the planner chooses again.
+local ROUTE_KEYS = { "char", "prof", "to", "strictCheapest", "patterns", "vendorPatterns", "limitedPatterns", "useStock",
+    "altStock", "ahMode", "credit", "cooldowns", "stations", "discolored", "bothOnly" }
+ns.KEEP_SECONDS = 12 * 3600
+
+function ns.RouteKey(request)
+    local parts = {}
+    for _, key in ipairs(ROUTE_KEYS) do table.insert(parts, tostring(request[key])) end
+    return table.concat(parts, "|")
 end
 
 -- Things the player has to know before trusting the numbers on screen.
@@ -603,11 +621,13 @@ local function buildControls(ui, frame)
         request.to = tonumber(ui.toEdit:GetText()) or request.to
         ui.fromEdit:ClearFocus()
         ui.toEdit:ClearFocus()
+        ns.freshPlan = true
         ns.RefreshUI()
     end
     local right = -14
     ui.planButton = W.button(frame, "Plan", 64, 26, "primary", applyRange)
     ui.planButton:SetPoint("TOPRIGHT", right, -HEADER_H - 14)
+    W.tooltip(ui.planButton, "Plan", "Choose the route again from what you have now. Until you press it the route stays as it is: buying, crafting and skill gained only update the counts and the costs.")
     ui.maxButton = W.button(frame, "To 300", 58, 26, nil, function()
         ns.request.to = ns.MAX_SKILL
         ns.RefreshUI()
@@ -893,7 +913,7 @@ local function put(ui, x, y, width, value, size, colour, justify, wrap)
     label:SetText(value or "")
     local height = wrap and label:GetStringHeight() or 0
     if not height or height < size + 1 then height = size + 1 end
-    return math.ceil(height)
+    return math.ceil(height), label
 end
 
 local function block(ui, kind, x, y, width, height, colour, alpha)
@@ -954,48 +974,167 @@ function ns.LinkItem(itemId, name)
     return handled
 end
 
-local function itemClick(self)
-    local shift = rawget(_G, "IsShiftKeyDown")
-    if type(shift) == "function" and shift() then ns.LinkItem(self.item, self.name) end
+local function say(text)
+    local chat = rawget(_G, "DEFAULT_CHAT_FRAME")
+    if chat and chat.AddMessage then chat:AddMessage("|cffffc842Profession Planner:|r " .. text) end
 end
 
--- An invisible click area over an item's name.
-local function rowHit(ui, x, y, width, height, itemId, name)
+-- The game's ids for the professions (its skill lines; the recipe data is built from the same ids).
+local SKILL_LINES = { Alchemy = 171, Blacksmithing = 164, Cooking = 185, Enchanting = 333, Engineering = 202,
+    ["First Aid"] = 129, Leatherworking = 165, Mining = 186, Tailoring = 197 }
+
+-- What the game's profession window shows right now: whether it is up, and the recipe (spell
+-- id) on its page, nil when the window cannot say.
+local function professionWindow()
+    local frame = rawget(_G, "ProfessionsFrame")
+    if type(frame) ~= "table" or type(frame.IsShown) ~= "function" then return false, nil end
+    local ok, shown = pcall(frame.IsShown, frame)
+    if not ok or not shown then return false, nil end
+    local page = frame.CraftingPage
+    local form = type(page) == "table" and page.SchematicForm or nil
+    if type(form) == "table" and type(form.GetRecipeInfo) == "function" then
+        local fine, info = pcall(form.GetRecipeInfo, form)
+        if fine and type(info) == "table" then return true, tonumber(info.recipeID) end
+    end
+    return true, nil
+end
+
+-- Whether the character being played knows the recipe: true, false, or nil when the game cannot say.
+local function knowsRecipe(spell)
+    local answer
+    for _, name in ipairs({ "IsPlayerSpell", "IsSpellKnown" }) do
+        local check = rawget(_G, name)
+        if type(check) == "function" then
+            local ok, known = pcall(check, spell)
+            if ok and known then return true end
+            if ok then answer = false end
+        end
+    end
+    return answer
+end
+
+-- A plain click on a recipe opens the game's profession window at that recipe, the way a click
+-- on a tracked recipe does in the game's own interface: C_TradeSkillUI.OpenRecipe asks the game
+-- and the profession window answers by turning to the recipe. Calls that open windows or cast
+-- can be limited to the moment the game is handling a click, so the call is made here, inside
+-- the click, and never from a timer; only the look afterwards waits, and it speaks up in chat
+-- when the window did not follow.
+local opening = 0
+function ns.OpenRecipe(spell, name, profession)
+    spell = tonumber(spell)
+    if not spell then return false end
+    local label = tostring(name or ("recipe " .. spell))
+    opening = opening + 1
+    local mine = opening
+    -- The route on screen may be another character's.
+    local live = ns.ReadLiveSkills()
+    if profession and next(live) ~= nil and not live[profession] then
+        say("the character you are playing has not learned " .. profession .. ", so there is no window to open for " .. label .. ".")
+        return false
+    end
+    local api = rawget(_G, "C_TradeSkillUI")
+    local openRecipe = type(api) == "table" and api.OpenRecipe or nil
+    local openProfession = type(api) == "table" and api.OpenTradeSkill or nil
+    -- The window's code is loaded on first use; the game's recipe tracker loads it the same way before it asks.
+    local load = rawget(_G, "ProfessionsFrame_LoadUI")
+    if rawget(_G, "ProfessionsFrame") == nil and type(load) == "function" then pcall(load) end
+    local asked, refused
+    if type(openRecipe) == "function" then
+        local ok, why = pcall(openRecipe, spell)
+        if ok then asked = "recipe" else refused = tostring(why) end
+    end
+    local line = SKILL_LINES[profession or ""]
+    if not asked and type(openProfession) == "function" and line then
+        local ok, opened = pcall(openProfession, line)
+        if ok and opened ~= false then asked = "profession" elseif not ok then refused = refused or tostring(opened) end
+    end
+    if not asked then
+        local missing = type(openRecipe) ~= "function" and type(openProfession) ~= "function"
+        say("could not open " .. label .. " from here"
+            .. (missing and ": this game client has no call for it (C_TradeSkillUI.OpenRecipe and OpenTradeSkill are both missing)" or "")
+            .. (refused and (": the game said " .. refused) or "")
+            .. ". Open " .. (profession or "the profession") .. " yourself and pick it in the list.")
+        return false
+    end
+    local timer = rawget(_G, "C_Timer")
+    if type(timer) ~= "table" or type(timer.After) ~= "function" then return true end
+    local function look(last)
+        if mine ~= opening then return end                     -- a later click took over
+        local shown, showing = professionWindow()
+        if shown and showing == spell then return end           -- it worked: nothing to say
+        if not last then timer.After(1.5, function() look(true) end); return end
+        if not shown then
+            say("asked the game to open " .. label .. ", but no profession window appeared. Open " .. (profession or "the profession") .. " yourself and pick it in the list.")
+        elseif asked == "profession" then
+            say("opened " .. (profession or "the profession") .. ", but "
+                .. (refused and ("the game would not turn to the recipe (it said " .. refused .. ")")
+                    or "this game client has no call to turn to a recipe (C_TradeSkillUI.OpenRecipe is missing)")
+                .. ". Pick " .. label .. " in the list.")
+        elseif showing ~= nil then
+            say("the profession window is open but did not turn to " .. label
+                .. (knowsRecipe(spell) == false and ": this character has not learned it yet." or ". Pick it in the list."))
+        end
+    end
+    timer.After(0.5, function() look(false) end)
+    return true
+end
+
+-- A plain click on something the planner can make opens its recipe; a shift-click on any item
+-- hands on its link, as before.
+local function itemClick(self)
+    local shift = rawget(_G, "IsShiftKeyDown")
+    if type(shift) == "function" and shift() then ns.LinkItem(self.item, self.name)
+    elseif self.spell then ns.OpenRecipe(self.spell, self.recipe or self.name, self.prof) end
+end
+
+local OPEN_HINT = "Click to open this recipe in your profession window."
+
+local function itemTip(self)
+    local tip = rawget(_G, "GameTooltip")
+    if not tip then return end
+    tip:SetOwner(self, self.tipAnchor or "ANCHOR_RIGHT")
+    local shown = self.item and pcall(tip.SetHyperlink, tip, "item:" .. self.item)
+    if not shown then tip:SetText(self.name or "Unknown item", 1, 1, 1) end
+    if self.spell then tip:AddLine(OPEN_HINT, 0.45, 0.78, 1) end
+    tip:Show()
+end
+
+local function hideTip()
+    local tip = rawget(_G, "GameTooltip")
+    if tip then tip:Hide() end
+end
+
+-- An invisible click area over an item's name. Over a recipe's name (spell given) a plain click
+-- opens the recipe and hovering shows what it makes.
+local function rowHit(ui, x, y, width, height, itemId, name, spell, recipe, prof)
     local hit = acquire(ui, "hit", function()
         local created = CreateFrame("Button", nil, ui.content)
+        created.tipAnchor = "ANCHOR_CURSOR"
         created:SetScript("OnClick", itemClick)
+        created:SetScript("OnEnter", function(self) if self.spell then itemTip(self) end end)
+        created:SetScript("OnLeave", function(self) if self.spell then hideTip() end end)
         return created
     end)
     hit:SetSize(width, height)
     hit:SetPoint("TOPLEFT", ui.content, "TOPLEFT", x, y)
-    hit.item, hit.name = itemId, name
+    hit.item, hit.name, hit.spell, hit.recipe, hit.prof = itemId, name, spell, recipe, prof
     return hit
 end
 
-local function rowIcon(ui, x, y, size, itemId, name)
+local function rowIcon(ui, x, y, size, itemId, name, spell, recipe, prof)
     local icon = acquire(ui, "icon", function()
         local created = CreateFrame("Button", nil, ui.content)
         created.art = created:CreateTexture(nil, "ARTWORK")
         created.art:SetAllPoints()
         created.art:SetTexCoord(0.07, 0.93, 0.07, 0.93)
-        created:SetScript("OnEnter", function(self)
-            local tip = rawget(_G, "GameTooltip")
-            if not tip then return end
-            tip:SetOwner(self, "ANCHOR_RIGHT")
-            local shown = self.item and pcall(tip.SetHyperlink, tip, "item:" .. self.item)
-            if not shown then tip:SetText(self.name or "Unknown item", 1, 1, 1) end
-            tip:Show()
-        end)
-        created:SetScript("OnLeave", function()
-            local tip = rawget(_G, "GameTooltip")
-            if tip then tip:Hide() end
-        end)
+        created:SetScript("OnEnter", itemTip)
+        created:SetScript("OnLeave", hideTip)
         created:SetScript("OnClick", itemClick)
         return created
     end)
     icon:SetSize(size, size)
     icon:SetPoint("TOPLEFT", ui.content, "TOPLEFT", x, y)
-    icon.item, icon.name = itemId, name
+    icon.item, icon.name, icon.spell, icon.recipe, icon.prof = itemId, name, spell, recipe, prof
     icon.art:SetTexture(W.itemIcon(itemId))
     return icon
 end
@@ -1080,13 +1219,24 @@ local function renderRoute(ui, plan, y)
             local bg = block(ui, "bg", 0, top, CONTENT_W, 10, C.panel, 1)
             local bar = block(ui, "art", 0, top, 3, 10, bandColour(step.band), 1)
             rowTick(ui, 14, top - 15, step.spell)
-            rowIcon(ui, 42, top - 9, 30, step.productItem, step.product or step.recipe)
+            rowIcon(ui, 42, top - 9, 30, step.productItem, step.product or step.recipe, step.spell, step.recipe, request.prof)
             local x, narrow = 84, CONTENT_W - 84 - 300
             local cy = top - 9
-            cy = cy - put(ui, x, cy, narrow, step.recipe, 13, QUALITY[step.q or 1] or C.text) - 4
+            local titleHeight, title = put(ui, x, cy, narrow, step.recipe, 13, QUALITY[step.q or 1] or C.text)
+            -- The click area is as wide as the name, not the column, so empty space beside it stays inert.
+            local titleWidth = title:GetStringWidth()
+            if type(titleWidth) ~= "number" or titleWidth < 24 then titleWidth = narrow end
+            rowHit(ui, x - 2, cy + 2, math.min(narrow, titleWidth + 6), titleHeight + 4, step.productItem, step.product or step.recipe,
+                step.spell, step.recipe, request.prof)
+            cy = cy - titleHeight - 4
             local crafts = step.crafts .. (step.crafts == 1 and " craft" or " crafts")
             if request.simulate and (step.safeCrafts or 0) > step.crafts then
-                crafts = crafts .. " (up to " .. step.safeCrafts .. ")"
+                crafts = crafts .. ", " .. step.safeCrafts .. " if unlucky"
+            end
+            -- Far more crafts than points: say how many for each point.
+            local points = step.to - step["from"]
+            if points >= 1 and step.crafts >= 1.5 * points and step.crafts - points >= 3 then
+                crafts = crafts .. string.format(", about %.1f crafts per point", step.crafts / points)
             end
             cy = cy - put(ui, x, cy, narrow, string.format("Skill %d - %d     %s     %s%s%s", step["from"], step.to, crafts,
                 hex(bandColour(step.band)), tostring(step.band or ""), DONE), 11, C.dim) - 6
@@ -1108,7 +1258,9 @@ local function renderRoute(ui, plan, y)
                 table.insert(materials, entry)
             end
             if #materials > 0 then cy = cy - put(ui, x, cy, wide, table.concat(materials, "     "), 11, C.text, "LEFT", true) - 4 end
-            if step.pattern then
+            if step.pattern and step.pattern.src == "Owned" then
+                cy = cy - put(ui, x, cy, wide, "You have " .. step.pattern.name .. ": use it to learn this recipe.", 11, C.good, "LEFT", true) - 4
+            elseif step.pattern then
                 local where = step.pattern.src == "Vendor" and "Buy from a vendor: " or "Buy on the AH: "
                 cy = cy - put(ui, x, cy, wide, where .. step.pattern.name .. " for " .. ns.Coins(step.pattern.price), 11, C.accent, "LEFT", true) - 4
             end
@@ -1144,13 +1296,21 @@ local function renderRoute(ui, plan, y)
                 local mapped = step.pattern and step.pattern.src == "Vendor" and #ns.VendorStops(source, faction) > 0
                 local pinnedHere = mapped and ns.pinned and ns.pinned.source == source
                 local room = mapped and (wide - (pinnedHere and 182 or 104)) or wide
-                local height = put(ui, x, cy, room, "Learn: " .. ns.SourceWithCoords(source, faction), 11, C.dim, "LEFT", true)
+                -- A trainer recipe shows the skill the planner uses, not the one in the shipped text.
+                local learnText = ns.TrainerLearnText(source, step.learn, step.learnSrc, step.unconfirmed, step.spell)
+                local height = put(ui, x, cy, room, "Learn: " .. (learnText or ns.SourceWithCoords(source, faction)), 11, C.dim, "LEFT", true)
                 if mapped then
                     rowButton(ui, x + wide - 96, cy + 4, "Show on map", function() ns.ShowVendor(source, faction) end, 96)
                     if pinnedHere then rowButton(ui, x + wide - 174, cy + 4, "Clear pin", function() ns.ClearPin() end, 72) end
                     height = math.max(height, 20)
                 end
                 cy = cy - height - 4
+            end
+            if step.unconfirmed then
+                local text = "No trainer has been seen offering this at " .. tostring(step.learn) .. " yet"
+                if step.learnWas then text = text .. " (older data said " .. tostring(step.learnWas) .. ")" end
+                text = text .. ". Open a " .. tostring(request.prof) .. " trainer's window to check."
+                cy = cy - put(ui, x, cy, wide, text, 10, C.dim, "LEFT", true) - 4
             end
             if step.alts and #step.alts > 0 then
                 local alternatives = {}
@@ -1238,23 +1398,37 @@ local function renderRecipes(ui, plan, y)
         local status = STATUS[row.via or ""]
         local statusText, statusColour = status and status[1] or "Not available", status and C[status[2]] or C.faint
         if row.limited then statusText, statusColour = "Buy (limited)", C.warn end
+        if row.owned then statusText, statusColour = "You have the recipe", C.good end
         if avoided then statusText, statusColour = "Avoided", C.warn end
+        -- A trainer that did not offer the recipe: the status says which one and at what skill.
+        local gone = not row.via and not avoided and row.why and ns.TrainerMissingEntry(row.spell, request.trainerMissing) or nil
+        local statusWidth = 100
+        if gone and row.why == ns.TrainerMissingReason(gone) then
+            statusText, statusColour, statusWidth = ns.TrainerMissingStatus(gone), C.warn, CONTENT_W - 626 - 8
+        end
         local note
+        local learnText
         if not row.via and row.why and not avoided then note = row.why
-        elseif row.source and row.via ~= "known" and row.via ~= "auto" then note = ns.SourceForFaction(row.source, ns.profile and ns.profile.faction) end
+        elseif row.source and row.via ~= "known" and row.via ~= "auto" then
+            learnText = ns.TrainerLearnText(row.source, row.learn, row.learnSrc, row.unconfirmed, row.spell)
+            note = learnText or ns.SourceForFaction(row.source, ns.profile and ns.profile.faction)
+        end
+        local unsure = row.unconfirmed and row.via and row.via ~= "known" and row.via ~= "auto"
+        if unsure and not learnText then note = (note and (note .. "  ") or "") .. "Learn rank not confirmed in this game yet." end
         local nameColour = row.via and (BAND[row.colour or ""] or C.text) or C.faint
         local noteHeight = 0
         if note then noteHeight = put(ui, 40, y - 24, CONTENT_W - 120, note, 10, C.faint, "LEFT", true) + 4 end
         local height = 26 + noteHeight
         stripe(ui, y, height, index)
-        rowIcon(ui, 10, y - 3, 20, row.item, row.name)
+        rowIcon(ui, 10, y - 3, 20, row.item, row.name, row.spell, row.name, request.prof)
         put(ui, 40, y - 7, 236, row.name, 11, nameColour)
-        put(ui, 280, y - 7, 44, tostring(row.learn or "-"), 11, C.dim, "RIGHT")
+        rowHit(ui, 34, y - 2, 242, 22, row.item, row.name, row.spell, row.name, request.prof)
+        put(ui, 280, y - 7, 44, tostring(row.learn or "-") .. (unsure and "?" or ""), 11, C.dim, "RIGHT")
         put(ui, 328, y - 7, 50, tostring(row.yellow or "-"), 11, C.dim, "RIGHT")
         put(ui, 382, y - 7, 44, tostring(row.grey or "-"), 11, C.dim, "RIGHT")
         put(ui, 430, y - 7, 88, row.mats and ns.Coins(row.mats) or "-", 11, C.dim, "RIGHT")
         put(ui, 522, y - 7, 88, row.perPoint and ns.Coins(row.perPoint) or "-", 11, row.perPoint and C.accent or C.faint, "RIGHT")
-        put(ui, 626, y - 7, 100, statusText, 11, statusColour)
+        put(ui, 626, y - 7, statusWidth, statusText, statusWidth > 100 and 10 or 11, statusColour)
         if avoided then
             rowButton(ui, CONTENT_W - 66, y - 2, "Allow", function() ns.ToggleAvoid(row.spell) end)
         elseif row.via then
@@ -1288,9 +1462,10 @@ local function renderProfit(ui, plan, y)
         if note then noteHeight = put(ui, 40, y - 24, CONTENT_W - 54, note, 10, C.faint, "LEFT", true) + 4 end
         local height = 26 + noteHeight
         stripe(ui, y, height, index)
-        rowIcon(ui, 10, y - 3, 20, row.item, row.product)
+        rowIcon(ui, 10, y - 3, 20, row.item, row.product, row.spell, row.recipe, request.prof)
         local chance = math.floor(row.chance * 100 + 0.5)
         put(ui, 40, y - 7, 216, row.recipe, 11, BAND[row.colour or ""] or C.text)
+        rowHit(ui, 34, y - 2, 222, 22, row.item, row.product, row.spell, row.recipe, request.prof)
         put(ui, 260, y - 7, 138, row.product, 11, QUALITY[row.q or 1] or C.dim)
         put(ui, 402, y - 7, 54, row.sellHow == "vendor" and "Vendor" or "AH", 11, row.sellHow == "vendor" and C.dim or C.info)
         put(ui, 460, y - 7, 92, ns.Coins(row.margin), 11, C.good, "RIGHT")
@@ -1387,7 +1562,7 @@ local function renderStats(ui, plan, y)
         local luckLabel, luckColour = luckText(luck)
         local product = recipe and recipe.products and recipe.products[1] and recipe.products[1].item or nil
         stripe(ui, y, 26, position)
-        if product then rowIcon(ui, 10, y - 3, 20, product, recipe.name) end
+        if product then rowIcon(ui, 10, y - 3, 20, product, recipe.name, entry.spell, recipe.name, recipe.prof) end
         put(ui, 40, y - 7, 256, recipe and recipe.name or ("Spell " .. tostring(entry.spell)), 11, C.text)
         put(ui, 300, y - 7, 60, tostring(record.crafts), 11, C.dim, "RIGHT")
         put(ui, 364, y - 7, 60, tostring(record.points), 11, C.text, "RIGHT")
@@ -1557,7 +1732,7 @@ function ns.RefreshUI()
     request.exclude = request.exclude or {}
     ns.ClampRange(request)
     local saved = {}
-    for key, value in pairs(request) do if key ~= "exclude" then saved[key] = value end end
+    for key, value in pairs(request) do if key ~= "exclude" and key ~= "lock" then saved[key] = value end end
     ns.DB.settings.request = saved
     ns.DB.settings.exclude = copyTable(request.exclude)
 
@@ -1576,9 +1751,37 @@ function ns.RefreshUI()
         chip.label:SetTextColor(ink[1], ink[2], ink[3])
     end
 
+    -- One kept route per character and profession, so looking at another profession and coming back
+    -- finds the route as it was left.
+    local settings = ns.DB.settings
+    if type(settings.locks) ~= "table" then settings.locks = {} end
+    local slot = tostring(request.char) .. "|" .. tostring(request.prof)
+    local key, kept = ns.RouteKey(request), settings.locks[slot]
+    local clock = rawget(_G, "time")
+    local now = type(clock) == "function" and clock() or 0
+    local keep = not ns.freshPlan and type(kept) == "table" and type(kept.steps) == "table" and kept.key == key
+        and now - (tonumber(kept.at) or 0) < ns.KEEP_SECONDS
+    ns.freshPlan = nil
+    request.lock = keep and kept or nil
     local ok, plan = pcall(ns.BuildPlan, request, ns.profile, ns.prices)
     if ok then
-        ui.status:SetText("Prices: " .. (plan.prices.source or "Vendor only") .. "        Route: " .. (plan.options.routeSearch or "low-swap route"))
+        if type(plan.lock) == "table" then
+            plan.lock.key = key
+            plan.lock.at = keep and tonumber(kept.at) or now
+            settings.locks[slot] = plan.lock
+            for other, lock in pairs(settings.locks) do
+                if type(lock) ~= "table" or now - (tonumber(lock.at) or 0) >= ns.KEEP_SECONDS then settings.locks[other] = nil end
+            end
+        end
+        local route = plan.options.routeSearch or "fewest recipe changes"
+        if plan.locked then route = route .. ", kept until you press Plan" end
+        ui.status:SetText("Prices: " .. (plan.prices.source or "Vendor only") .. "        Route: " .. route)
+        local explained = plan.lockBroken and ns.routeExplained and ns.routeExplained[plan.lockBroken.spell]
+        if explained then ns.routeExplained[plan.lockBroken.spell] = nil end
+        if plan.locked and plan.lockBroken and not ns.quietBreak and not explained then
+            say((plan.lockBroken.name or "A recipe") .. " is out, so the route was chosen again from skill "
+                .. plan.lockBroken.skill .. " for that stretch. The rest is as planned.")
+        end
     else
         local message = string.gsub(tostring(plan), "^.-:%d+: ", "")
         plan = failedPlan(request, message)
@@ -1607,6 +1810,7 @@ function ns.RefreshUI()
             ui.without[step.spell] = step.without
         end
     end
+    request.lock = nil
     ui.currentPlan = plan
     refreshSummary(ui, request, char, plan)
     ns.RenderUI()

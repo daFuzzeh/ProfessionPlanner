@@ -3,6 +3,12 @@ local addonName, ns = ...
 ns.MAX_SKILL = 300
 ns.MIN_RUN = 4
 ns.MIN_CHANCE = 0.25
+-- A grind below MIN_CHANCE is still used when it costs less than GRIND_RATIO of the best normal recipe per point
+-- (measured at full price), but never below GRIND_FLOOR: ten crafts a point is the limit whatever it saves.
+ns.GRIND_RATIO = 0.25
+ns.GRIND_FLOOR = 0.10
+-- The per-point route replaces the low-swap route only when it costs under this share of it.
+ns.SWAP_MARGIN = 0.95
 ns.STOCK_SHADOW = 0.25
 ns.BASIC_FOCUS = { Anvil = true, Forge = true, ["Cooking Fire"] = true }
 ns.CAP_NOTES = {
@@ -28,7 +34,8 @@ function ns.SkillChance(recipe, skill)
 end
 
 function ns.Colour(recipe, skill)
-    local mid = recipe.mid or ((recipe.yellow + recipe.grey) / 2.0)
+    -- Green starts at the whole-number midpoint, as the game shows it (yellow 50, grey 75: green from 62).
+    local mid = recipe.mid or math.floor((recipe.yellow + recipe.grey) / 2)
     if skill < recipe.yellow then return "orange" end
     if skill < mid then return "yellow" end
     if skill < recipe.grey then return "green" end
@@ -37,9 +44,12 @@ end
 
 function ns.PrepareData()
     local raw = ns.RawData
-    local data = { build = raw.build, items = raw["items"], recipes = raw.recipes, by_prof = {}, vendor = {} }
+    local data = { build = raw.build, items = raw["items"], recipes = raw.recipes, by_prof = {}, by_spell = {}, vendor = {} }
     for _, recipe in ipairs(data.recipes) do
-        recipe.mid = (recipe.yellow + recipe.grey) / 2.0
+        recipe.mid = math.floor((recipe.yellow + recipe.grey) / 2)
+        -- A list: two spells are filed under more than one profession.
+        if not data.by_spell[recipe.spell] then data.by_spell[recipe.spell] = {} end
+        table.insert(data.by_spell[recipe.spell], recipe)
         if not data.by_prof[recipe.prof] then data.by_prof[recipe.prof] = {} end
         table.insert(data.by_prof[recipe.prof], recipe)
     end
@@ -123,8 +133,229 @@ end
 -- Forever also has a teaching item for many trainer recipes; having one does not mean the
 -- recipe has to be bought.
 function ns.TrainerTaught(recipe)
+    -- Read from a trainer's window in this game: nothing says it more surely.
+    if recipe and recipe.seen then return true end
     local source = recipe and recipe.source
     return type(source) == "string" and string.find(string.lower(source), "^trainer") ~= nil
+end
+
+-- Trainer learn ranks ---------------------------------------------------------
+-- The server decides the skill a trainer asks for a recipe; the client's tables do not hold
+-- it. The shipped ranks are second-hand (some are marked unconfirmed), so whatever a trainer
+-- window in the game shows replaces them. Kept in the saved variables, account-wide.
+
+-- The recipe a trainer service teaches, or nil when the name fits none, or several that
+-- cannot be told apart.
+function ns.TrainerRecipe(prof, name)
+    local found, taught = {}, {}
+    for _, recipe in ipairs(ns.D and ns.D.by_prof[prof] or {}) do
+        if recipe.name == name then
+            table.insert(found, recipe)
+            if ns.TrainerTaught(recipe) then table.insert(taught, recipe) end
+        end
+    end
+    if #found == 1 then return found[1] end
+    -- Namesakes: only the one already known to be trainer-taught can be meant.
+    if #taught == 1 then return taught[1] end
+    return nil
+end
+
+local function wholeRank(value)
+    if type(value) ~= "number" or value < 1 or value > ns.MAX_SKILL then return nil end
+    return math.floor(value)
+end
+
+-- Put the ranks read from trainer windows over the shipped ones. `seen` is
+-- spell -> { rank = n }. What was shipped is kept in recipe.shipped.
+function ns.ApplyTrainerRanks(seen)
+    if not ns.D or type(seen) ~= "table" then return 0 end
+    local applied = 0
+    for spell, entry in pairs(seen) do
+        local rank = type(entry) == "table" and wholeRank(entry.rank) or nil
+        for _, recipe in ipairs(rank and ns.D.by_spell[tonumber(spell) or 0] or {}) do
+            if recipe.shipped == nil then
+                recipe.shipped = { learn = recipe.learn, learnSrc = recipe.learnSrc, unconfirmed = recipe.unconfirmed, auto = recipe.auto }
+            end
+            recipe.learn, recipe.learnSrc, recipe.approx, recipe.unconfirmed, recipe.seen = rank, "Trainer (read in game)", false, nil, true
+            -- A recipe that comes with the profession needs no skill; a trainer asking for some teaches it.
+            if rank > 1 then recipe.auto = false end
+            applied = applied + 1
+        end
+    end
+    return applied
+end
+
+-- `services` is what one trainer window lists: { name =, skill =, rank = } each. Stores the
+-- ranks in `store` and returns how many are new or changed, and how many of those differ
+-- from what the planner was using.
+function ns.RecordTrainerRanks(store, services, npc, now)
+    local fresh, differ, changed = 0, 0, {}
+    if not ns.D or type(store) ~= "table" then return fresh, differ, changed end
+    for _, service in ipairs(services or {}) do
+        local rank = wholeRank(service.rank)
+        if rank and type(service.name) == "string" and type(service.skill) == "string" and ns.D.by_prof[service.skill] then
+            local recipe = ns.TrainerRecipe(service.skill, service.name)
+            -- A rank past the point where the recipe turns grey is some other recipe's.
+            if recipe and not ((recipe.grey or 0) > 0 and rank > recipe.grey) then
+                local old = store[recipe.spell]
+                if type(old) ~= "table" or old.rank ~= rank then
+                    fresh = fresh + 1
+                    if recipe.learn ~= rank then
+                        differ = differ + 1
+                        table.insert(changed, { name = recipe.name, rank = rank, was = recipe.learn, spell = recipe.spell })
+                    end
+                end
+                store[recipe.spell] = { rank = rank, npc = npc, at = now }
+            end
+        end
+    end
+    return fresh, differ, changed
+end
+
+-- A trainer that does not offer a recipe ------------------------------------
+-- A shipped rank that no trainer has confirmed can be wrong in a way that matters: the recipe
+-- may be taught at a higher skill than the planner thinks. A trainer window that lists other
+-- recipes of the profession but not this one, for a character whose skill is already at the
+-- shipped rank, shows the rank is too low. The recipe is kept out of routes (ns.Explain) until
+-- a trainer lists it. Kept in the saved variables, account-wide:
+-- trainerMissing[spell] = { npc = trainer name, skill = character skill, at = time }.
+
+-- "A", "A and B", "A, B and C", "A, B, C and 2 more": three names at most.
+function ns.NameList(names)
+    local count = #names
+    if count <= 1 then return names[1] or "" end
+    if count <= 3 then return table.concat(names, ", ", 1, count - 1) .. " and " .. names[count] end
+    return names[1] .. ", " .. names[2] .. ", " .. names[3] .. " and " .. (count - 3) .. " more"
+end
+
+-- A recipe the character being played learned a moment ago (NEW_RECIPE_LEARNED). TradeSkillMaster only finds
+-- out when the profession window is next opened; until then the route would still say to buy or learn it.
+-- Kept for the session: by the next login TSM has it, or the profession was dropped.
+ns.learnedNow = {}
+function ns.NoteLearned(spell)
+    local id = ns.profile and ns.profile.currentId
+    if not id or type(spell) ~= "number" then return end
+    ns.learnedNow[id] = ns.learnedNow[id] or {}
+    ns.learnedNow[id][spell] = true
+end
+
+-- Whether TSM says the character being played already knows the recipe.
+function ns.PlayedKnows(spell)
+    local profile = ns.profile
+    local id = profile and profile.currentId
+    local char = id and profile.chars and profile.chars[id] or nil
+    if not char then return false end
+    if ns.learnedNow[id] and ns.learnedNow[id][spell] then return true end
+    local name = char.name or string.match(id, "^(.-) %-") or id
+    local craft = profile.crafts and profile.crafts[spell] or nil
+    return type(craft) == "table" and type(craft.players) == "table" and craft.players[name] == true
+end
+
+-- `listed` is every service one trainer window lists: { name =, skill = } (no skill line when the
+-- service asks for none). `skills` is profession -> the played character's skill, `knows` a
+-- function(spell) -> boolean, `check` false when the window may be hiding recipes (a type
+-- filter is off). Recipes the window lists leave `store`; with `check`, the unconfirmed trainer
+-- recipes of the profession the window teaches that the character could learn at its skill but
+-- the window does not list are put in. Returns the recipes newly put in (or put in again for a
+-- different trainer or skill) and how many were taken out.
+function ns.RecordTrainerMissing(store, listed, npc, skills, knows, now, check)
+    local added, cleared = {}, 0
+    if not ns.D or type(store) ~= "table" or type(listed) ~= "table" then return added, cleared end
+    local named, loose = {}, {}
+    for _, service in ipairs(listed) do
+        if type(service.name) == "string" then
+            if type(service.skill) == "string" then
+                named[service.skill] = named[service.skill] or {}
+                named[service.skill][service.name] = true
+            else
+                -- A service that asks for no skill does not say which profession it belongs to.
+                loose[service.name] = true
+            end
+        end
+    end
+    local function lists(recipe)
+        return loose[recipe.name] == true or (named[recipe.prof] ~= nil and named[recipe.prof][recipe.name] == true)
+    end
+    for spell in pairs(store) do
+        for _, recipe in ipairs(ns.D.by_spell[tonumber(spell) or 0] or {}) do
+            if lists(recipe) then
+                store[spell] = nil
+                cleared = cleared + 1
+                break
+            end
+        end
+    end
+    if not check then return added, cleared end
+    -- The profession is the one the window's services tie to a recipe, as the rank read does.
+    local taught = {}
+    for _, service in ipairs(listed) do
+        if type(service.skill) == "string" and type(service.name) == "string" and ns.D.by_prof[service.skill]
+            and ns.TrainerRecipe(service.skill, service.name) then
+            taught[service.skill] = true
+        end
+    end
+    local professions = {}
+    for prof in pairs(taught) do table.insert(professions, prof) end
+    table.sort(professions)
+    for _, prof in ipairs(professions) do
+        local skill = type(skills) == "table" and skills[prof] or nil
+        if type(skill) == "number" then
+            for _, recipe in ipairs(ns.D.by_prof[prof]) do
+                if ns.TrainerTaught(recipe) and recipe.unconfirmed == true
+                    and type(recipe.learn) == "number" and recipe.learn <= skill
+                    and not lists(recipe) and not (type(knows) == "function" and knows(recipe.spell)) then
+                    local old = store[recipe.spell]
+                    if type(old) ~= "table" or old.npc ~= npc or old.skill ~= skill then
+                        store[recipe.spell] = { npc = npc, skill = skill, at = now }
+                        table.insert(added, recipe)
+                    end
+                end
+            end
+        end
+    end
+    return added, cleared
+end
+
+-- The record of a recipe a trainer did not offer, or nil. `store` defaults to the saved one.
+function ns.TrainerMissingEntry(spell, store)
+    if store == nil then store = ns.DB and ns.DB.trainerMissing or nil end
+    local entry = type(store) == "table" and store[spell] or nil
+    if type(entry) == "table" then return entry end
+    return nil
+end
+
+local function missingWho(entry)
+    return type(entry.npc) == "string" and entry.npc ~= "" and entry.npc or nil
+end
+
+-- Why such a recipe is out of the routes; the planner and the Recipes tab show this one text.
+function ns.TrainerMissingReason(entry)
+    local skill = tonumber(entry.skill)
+    return (missingWho(entry) or "A trainer") .. " did not offer it" .. (skill and (" at skill " .. skill) or "")
+        .. ". It returns when a trainer lists it."
+end
+
+-- The same, short, for the status column of the Recipes tab.
+function ns.TrainerMissingStatus(entry)
+    local skill = tonumber(entry.skill)
+    local who = missingWho(entry)
+    return "Not offered" .. (who and (" by " .. who) or "") .. (skill and (" at skill " .. skill) or "")
+end
+
+-- The Learn line of a recipe that trainers teach, with the skill the planner is really using in
+-- place of the one in the shipped text ("Trainer, 2s, learn at ~50" -> "Trainer, 2s, from skill
+-- 50 (not confirmed yet)"). nil for any other source: those keep their text.
+function ns.TrainerLearnText(source, learn, learnSrc, unconfirmed, spell)
+    if type(source) ~= "string" or not string.find(string.lower(source), "^trainer") or type(learn) ~= "number" then return nil end
+    local text = string.gsub(source, ",%s*learn at ~?%d+", "")
+    text = text .. ", from skill " .. learn
+    if learnSrc == "Trainer (read in game)" then
+        local read = ns.DB and type(ns.DB.trainerRanks) == "table" and ns.DB.trainerRanks[spell] or nil
+        local npc = type(read) == "table" and type(read.npc) == "string" and read.npc ~= "" and read.npc or nil
+        return text .. " (read from " .. (npc or "a trainer") .. ")"
+    end
+    if unconfirmed then return text .. " (not confirmed yet)" end
+    return text
 end
 
 local function isDiscolored(recipe)
@@ -144,11 +375,14 @@ function ns.NewContext(req, profile, prices)
         -- Vendor recipes sold one at a time are used unless the player turns them off.
         avoidLimited = req.limitedPatterns == false,
         seen = req.vendorSeen or (ns.DB and ns.DB.vendorSeen) or nil,
+        trainerMissing = req.trainerMissing or (ns.DB and ns.DB.trainerMissing) or nil,
         faction = req.faction or (profile and profile.faction) or nil,
         cooldowns = req.cooldowns == true, stations = req.stations == true,
         discolored = req.discolored == true, useStock = req.useStock ~= false,
         altStock = req.altStock == true, strict = req.strictCheapest ~= false,
-        known = {}, stock = {}, exclude = {}, unitCache = {},
+        -- A kept route (see ns.BuildPlan): the recipe for each stretch of skill is fixed, only counts and costs move.
+        lock = type(req.lock) == "table" and type(req.lock.steps) == "table" and req.lock or nil,
+        known = {}, stock = {}, held = {}, exclude = {}, unitCache = {},
     }
     if not ctx.D.by_prof[ctx.prof] then error("Unknown profession: " .. tostring(ctx.prof)) end
     if ctx.credit ~= "none" and ctx.credit ~= "vendor" and ctx.credit ~= "ah" then ctx.credit = "vendor" end
@@ -160,6 +394,10 @@ function ns.NewContext(req, profile, prices)
             for spell, craft in pairs(profile.crafts or {}) do
                 if craft.players and craft.players[baseName] then ctx.known[tonumber(spell)] = true end
             end
+            for spell in pairs(ns.learnedNow[ctx.char] or {}) do ctx.known[spell] = true end
+            -- What the character holds, whatever the stock option says: a recipe item bought for the
+            -- route is not bought, or charged, a second time.
+            for itemId, quantity in pairs(char.stock or {}) do ctx.held[tonumber(itemId) or itemId] = quantity end
             ctx.money = char.money
             local profession = char.profs and char.profs[ctx.prof]
             if profession and (profession.maxLevel or 0) > 0 then ctx.maxLevel = profession.maxLevel end
@@ -225,8 +463,13 @@ function ns.Explain(ctx, recipe)
     end
     if recipe.auto then return { via = "auto" }, nil end
     if known then return { via = "known" }, nil end
+    local gone = ctx.trainerMissing and ctx.trainerMissing[recipe.spell]
+    if type(gone) == "table" then return nil, ns.TrainerMissingReason(gone) end
     if recipe.learn == nil then return nil, "learn rank unknown" end
     if #(recipe.teachItems or {}) == 0 or ns.TrainerTaught(recipe) then return { via = "trainer" }, nil end
+    for _, itemId in ipairs(recipe.teachItems) do
+        if (ctx.held[itemId] or 0) > 0 then return { via = "pattern", pattern = { itemId, 0 }, acquisition = "Owned" }, nil end
+    end
     local bestItem, bestPrice, acquisition
     local vendorSold, vendorWhy = ns.VendorAccess(recipe.source, ctx.faction)
     local limitedSkipped = false
@@ -280,6 +523,32 @@ function ns.CraftCost(ctx, recipe, stock)
         credit = credit + value
     end
     return buy - credit, buy, credit, buy + shadow - credit
+end
+
+-- ns.CraftCost averaged over the next MIN_RUN crafts, for a recipe the route is not on yet. One leftover
+-- material in the bags makes a single craft look nearly free; judged on that one craft the route left its
+-- recipe for a full run of something worse (4 green Rough Sharpening Stone for one point, 45 to 46).
+function ns.RunCost(ctx, recipe, stock)
+    local net, buy, credit, effective = ns.CraftCost(ctx, recipe, stock)
+    if effective == math.huge then return net, buy, credit, effective end
+    local partly = false
+    for _, reagent in ipairs(recipe.reagents or {}) do
+        local have = stock[reagent.item] or 0
+        if have > 0 and have < reagent.qty * ns.MIN_RUN then partly = true; break end
+    end
+    if not partly then return net, buy, credit, effective end
+    local left = {}
+    for _, reagent in ipairs(recipe.reagents or {}) do left[reagent.item] = stock[reagent.item] end
+    local netSum, effectiveSum = 0, 0
+    for _ = 1, ns.MIN_RUN do
+        local oneNet, _, _, oneEffective = ns.CraftCost(ctx, recipe, left)
+        netSum, effectiveSum = netSum + oneNet, effectiveSum + oneEffective
+        for _, reagent in ipairs(recipe.reagents or {}) do
+            local have = left[reagent.item] or 0
+            left[reagent.item] = have - math.min(have, reagent.qty)
+        end
+    end
+    return netSum / ns.MIN_RUN, buy, credit, effectiveSum / ns.MIN_RUN
 end
 
 -- Why a route cannot go past a skill level: every recipe that would still give a point there,
@@ -357,6 +626,33 @@ local function closeStep(items, step, skill)
     end
 end
 
+local NO_STOCK = {}
+
+-- Is `top` enough better than the recipe the route is on to leave it? Ten percent cheaper per point; when both
+-- cost nothing, ten percent cheaper at full price; when both pay for themselves even then, a ten percent
+-- better skill-up chance. Without the last two a recipe that sold for more than it cost was ridden down to a
+-- 25% chance (113 Handstitched Leather Vests for 67 points) while an orange one that also paid sat unused.
+local function clearlyBetter(top, entry)
+    if top.rank < entry.rank - 0.10 * entry.rank - 1e-9 then return true end
+    if entry.rank > 0 or top.rank > 0 then return false end
+    if top.fullRank < entry.fullRank - 0.10 * entry.fullRank - 1e-9 then return true end
+    if entry.fullRank > 0 or top.fullRank > 0 then return false end
+    return entry.expectedPoints < 0.90 * top.expectedPoints - 1e-9
+end
+
+-- The stretch of a kept route that covers `skill`, and the stretch after it.
+local function lockedPart(lock, skill)
+    for index, part in ipairs(lock.steps) do
+        if skill >= part.s - 1e-9 and skill < part.e - 1e-9 then return part, lock.steps[index + 1] end
+    end
+end
+
+local function entryFor(scored, spell)
+    for _, entry in ipairs(scored) do
+        if entry.spell == spell then return entry end
+    end
+end
+
 function ns.PlanRoute(ctx, fromSkill, toSkill)
     local stock = {}
     for itemId, quantity in pairs(ctx.stock) do stock[itemId] = quantity end
@@ -387,7 +683,8 @@ function ns.PlanRoute(ctx, fromSkill, toSkill)
             if (availability.via == "known" or availability.via == "auto") or recipe.learn <= integerSkill then
                 local expectedPoints = ns.SkillChance(recipe, integerSkill) * recipe.skillups
                 if expectedPoints > 0 then
-                    local net, _, _, effective = ns.CraftCost(ctx, recipe, stock)
+                    local cost = (current and current.recipe.spell == recipe.spell) and ns.CraftCost or ns.RunCost
+                    local net, _, _, effective = cost(ctx, recipe, stock)
                     if effective ~= math.huge then
                         local patternCost = 0
                         if availability.pattern and not boughtPatterns[recipe.spell] then
@@ -395,11 +692,26 @@ function ns.PlanRoute(ctx, fromSkill, toSkill)
                             patternCost = availability.pattern[2] / math.max(1, span / math.max(expectedPoints, 0.3))
                         end
                         local base = ctx.strict and net or effective
+                        local perCraft = base + patternCost
                         local entry = {
-                            score = (base + patternCost) / expectedPoints, grey = recipe.grey,
+                            score = perCraft / expectedPoints, grey = recipe.grey,
                             yellow = recipe.yellow, spell = recipe.spell, recipe = recipe,
-                            availability = availability, expectedPoints = expectedPoints,
+                            availability = availability, expectedPoints = expectedPoints, perCraft = perCraft,
+                            net = net, effective = effective,
                         }
+                        -- A craft that pays for itself (own stock is free, or the product sells for more than
+                        -- it costs) ranks as free, no better. A negative cost divided by a smaller skill-up
+                        -- chance is more negative, which made the worse chance win and sent routes back to a
+                        -- recipe that was turning green.
+                        entry.rank = math.max(entry.score, 0)
+                        -- Among crafts that cost nothing, the one that would be cheapest per point at full
+                        -- price goes first: it spends the least of what is in the bags, and the route is the
+                        -- same one whether the materials are owned or still to buy.
+                        entry.fullRank = entry.rank
+                        if entry.rank <= 0 then
+                            local full = ns.CraftCost(ctx, recipe, NO_STOCK)
+                            entry.fullRank = math.max((full + patternCost) / expectedPoints, 0)
+                        end
                         table.insert(scored, entry)
                         if expectedPoints >= ns.MIN_CHANCE then hasDecentChance = true end
                     end
@@ -409,13 +721,31 @@ function ns.PlanRoute(ctx, fromSkill, toSkill)
         if #scored == 0 then stoppedAt = integerSkill; break end
         local filtered = scored
         if hasDecentChance then
+            -- Low-chance grinds are skipped while a normal recipe exists, unless the grind is far cheaper per
+            -- point. Dropping them whatever the price made a route buy a 6g recipe for its last four points.
+            local bestDecent = math.huge
+            for _, entry in ipairs(scored) do
+                if entry.expectedPoints >= ns.MIN_CHANCE and entry.rank < bestDecent then bestDecent = entry.rank end
+            end
             filtered = {}
             for _, entry in ipairs(scored) do
-                if entry.expectedPoints >= ns.MIN_CHANCE then table.insert(filtered, entry) end
+                local keep = entry.expectedPoints >= ns.MIN_CHANCE
+                if not keep and bestDecent > 0 and entry.expectedPoints >= ns.GRIND_FLOOR then
+                    -- The grind is judged at full price: materials already owned must not make a nearly grey
+                    -- recipe look free, or the route would burn the bags on it.
+                    local full = ns.CraftCost(ctx, entry.recipe, NO_STOCK)
+                    local pattern = entry.perCraft - (ctx.strict and entry.net or entry.effective)
+                    keep = math.max((full + pattern) / entry.expectedPoints, 0) < ns.GRIND_RATIO * bestDecent
+                end
+                if keep then table.insert(filtered, entry) end
             end
         end
         table.sort(filtered, function(a, b)
-            if a.score ~= b.score then return a.score < b.score end
+            if a.rank ~= b.rank then return a.rank < b.rank end
+            if a.fullRank ~= b.fullRank then return a.fullRank < b.fullRank end
+            -- Equal cost per point: the better skill-up chance (fewer crafts), then the cheaper craft.
+            if a.expectedPoints ~= b.expectedPoints then return a.expectedPoints > b.expectedPoints end
+            if a.perCraft ~= b.perCraft then return a.perCraft < b.perCraft end
             if a.grey ~= b.grey then return a.grey < b.grey end
             if a.yellow ~= b.yellow then return a.yellow < b.yellow end
             return a.spell < b.spell
@@ -424,9 +754,23 @@ function ns.PlanRoute(ctx, fromSkill, toSkill)
         if not ctx.strict and current then
             for _, entry in ipairs(filtered) do
                 if entry.spell == current.recipe.spell then
-                    if run < ns.MIN_RUN or not (top.score < entry.score - 0.10 * math.abs(entry.score) - 1e-9) then pick = entry end
+                    if run < ns.MIN_RUN or not clearlyBetter(top, entry) then pick = entry end
                     break
                 end
+            end
+        end
+        local part, nextPart
+        if ctx.lock then part, nextPart = lockedPart(ctx.lock, skill) end
+        if part then
+            local kept = entryFor(scored, part.spell)
+            -- A kept step ends on a fraction (63.4). Planned again from a whole skill inside that last
+            -- fraction, its recipe may have just stopped giving skill; the next kept recipe takes over.
+            if not kept and nextPart and part.e - skill < 1 then kept = entryFor(scored, nextPart.spell) end
+            if kept then
+                pick = kept
+            elseif not ctx.lockBroken then
+                -- Rounded as the steps on screen are: a stretch kept from 55.6 is shown as starting at 56.
+                ctx.lockBroken = { skill = math.floor(skill + 0.5), spell = part.spell }
             end
         end
         local recipe, availability, expectedPoints = pick.recipe, pick.availability, pick.expectedPoints
@@ -438,13 +782,13 @@ function ns.PlanRoute(ctx, fromSkill, toSkill)
             local alternatives = {}
             for _, entry in ipairs(filtered) do
                 if entry.spell ~= recipe.spell and #alternatives < 3 then
-                    table.insert(alternatives, { spell = entry.spell, name = entry.recipe.name, score = entry.score })
+                    table.insert(alternatives, { spell = entry.spell, name = entry.recipe.name, score = entry.rank })
                 end
             end
             step = {
                 type = "step", spell = recipe.spell, recipeData = recipe, availability = availability,
                 startSkill = skill, crafts = 0, use = {}, stockUsed = {}, buyCost = 0, credit = 0,
-                patternCost = 0, colourStart = ns.Colour(recipe, integerSkill), score = pick.score, alts = alternatives,
+                patternCost = 0, colourStart = ns.Colour(recipe, integerSkill), score = pick.rank, alts = alternatives,
             }
             if availability.pattern and not boughtPatterns[recipe.spell] then
                 boughtPatterns[recipe.spell] = availability.pattern
@@ -507,6 +851,13 @@ local function buildPlanSingle(req, profile, prices)
         error("Skill range must be 1 to " .. ns.MAX_SKILL .. ", with From below To.")
     end
     local items, reached, warnings = ns.PlanRoute(ctx, fromSkill, toSkill)
+    -- What ns.BuildPlan needs to keep this route: each recipe with the exact stretch of skill it covers.
+    local routeLock = { search = ctx.strict and "strict" or "legacy", steps = {} }
+    for _, item in ipairs(items) do
+        if item.type == "step" then
+            table.insert(routeLock.steps, { spell = item.spell, s = item.startSkill, e = item.endSkill })
+        end
+    end
     local outSteps, totalNeed, totalStock, patternRows = {}, {}, {}, {}
     local spendPatterns, totalCredit, totalCrafts, previousEnd = 0, 0, 0, fromSkill
     local lastStep
@@ -570,6 +921,9 @@ local function buildPlanSingle(req, profile, prices)
                 crafts = item.crafts, safeCrafts = item.crafts,
                 band = item.colourStart == item.colourEnd and item.colourStart or (item.colourStart .. " to " .. item.colourEnd),
                 via = item.availability.via, learn = recipe.learn, approx = recipe.approx, learnSrc = recipe.learnSrc,
+                -- The learn rank is second-hand and has not been read from a trainer in this game.
+                unconfirmed = recipe.unconfirmed and item.availability.via ~= "known" and item.availability.via ~= "auto" or nil,
+                learnWas = recipe.learnWas,
                 source = recipe.source, yields = product and product.qty or 0,
                 product = product and ns.ItemName(ctx.D, product.item) or nil,
                 productItem = product and product.item or nil,
@@ -617,11 +971,14 @@ local function buildPlanSingle(req, profile, prices)
         table.insert(shopping, row)
     end
     for _, pattern in ipairs(patternRows) do
-        table.insert(shopping, {
-            item = pattern.item, name = pattern.name, need = 1, own = 0, buy = 1, unit = pattern.price,
-            src = pattern.src or "AH", cost = pattern.price, pattern = true, safeBuy = 1, safeCost = pattern.price,
-            q = (ctx.D["items"][pattern.item] or {}).q or 1, named = ns.HasItemName(ctx.D, pattern.item),
-        })
+        -- A recipe item the character already holds is not on the list to buy.
+        if pattern.src ~= "Owned" then
+            table.insert(shopping, {
+                item = pattern.item, name = pattern.name, need = 1, own = 0, buy = 1, unit = pattern.price,
+                src = pattern.src or "AH", cost = pattern.price, pattern = true, safeBuy = 1, safeCost = pattern.price,
+                q = (ctx.D["items"][pattern.item] or {}).q or 1, named = ns.HasItemName(ctx.D, pattern.item),
+            })
+        end
     end
     table.sort(shopping, function(a, b) if a.cost ~= b.cost then return a.cost > b.cost end return a.name < b.name end)
     local spend = spendMaterials + spendPatterns
@@ -677,32 +1034,64 @@ local function buildPlanSingle(req, profile, prices)
             safeSpend = math.floor(safeSpend + 0.5), safeCrafts = safeCrafts, thinSupply = thinSupply,
         },
         wallet = wallet, excluded = excluded, warnings = warnings,
+        lock = routeLock, lockBroken = ctx.lockBroken,
         options = { stock = ctx.useStock and next(ctx.stock) ~= nil, char = ctx.char, strictCheapest = ctx.strict,
             vendorPatterns = ctx.vendorPatterns, ahPatterns = ctx.ahPatterns },
         prices = { source = prices and prices.source or "Vendor only" },
     }
 end
 
+ns.BuildPlanSingle = buildPlanSingle
+
+local SEARCH_TEXT = { strict = "cheapest per skill point", legacy = "fewest recipe changes" }
+
+-- req.lock (the `lock` of an earlier plan) keeps that route: the same recipes over the same stretches of skill.
+-- Bags, gold and skill then only move the counts and the costs. Where a kept recipe can no longer be used the
+-- planner chooses freely for that stretch and reports it in plan.lockBroken = { skill, spell, name }.
 function ns.BuildPlan(req, profile, prices)
+    if type(req.lock) == "table" and type(req.lock.steps) == "table" then
+        local keptRequest = {}
+        for key, value in pairs(req) do keptRequest[key] = value end
+        local legacy = req.lock.search == "legacy"
+        keptRequest.strictCheapest = not legacy
+        local plan = buildPlanSingle(keptRequest, profile, prices)
+        plan.options.strictCheapest = req.strictCheapest ~= false
+        plan.options.routeSearch = SEARCH_TEXT[legacy and "legacy" or "strict"]
+        plan.locked = true
+        if plan.lockBroken then
+            -- plan.lock stays the route as it now is, for the caller to keep from here on.
+            local rows = ns.D.by_spell[plan.lockBroken.spell]
+            plan.lockBroken.name = rows and rows[1] and rows[1].name or nil
+        else
+            plan.lock = req.lock
+        end
+        return plan
+    end
     local strictPlan = buildPlanSingle(req, profile, prices)
     if req.strictCheapest == false then return strictPlan end
     local legacyRequest = {}
     for key, value in pairs(req) do legacyRequest[key] = value end
     legacyRequest.strictCheapest = false
     local legacyPlan = buildPlanSingle(legacyRequest, profile, prices)
-    local target = tonumber(req.to) or 75
-    local useLegacy = false
-    if strictPlan.reached < target and legacyPlan.reached > strictPlan.reached then
-        useLegacy = true
-    elseif legacyPlan.reached == strictPlan.reached and legacyPlan.summary.net < strictPlan.summary.net then
-        useLegacy = true
+    -- Two routes are built. The one with fewer recipe changes is shown unless the per-point route gets further
+    -- or costs at least 5% less. A route that pays for itself counts as free: crafting more of something that
+    -- sells is not a cheaper way to level.
+    local strictCost, legacyCost = math.max(strictPlan.summary.net, 0), math.max(legacyPlan.summary.net, 0)
+    local useLegacy
+    if strictPlan.reached ~= legacyPlan.reached then
+        useLegacy = legacyPlan.reached > strictPlan.reached
+    elseif strictCost > 0 or legacyCost > 0 then
+        useLegacy = not (strictCost < ns.SWAP_MARGIN * legacyCost - 1e-9)
+    else
+        -- Both pay for themselves: the one that needs less gold up front.
+        useLegacy = not (strictPlan.summary.spend < ns.SWAP_MARGIN * legacyPlan.summary.spend - 1e-9)
     end
     if useLegacy then
         legacyPlan.options.strictCheapest = true
-        legacyPlan.options.routeSearch = "cheapest completed route"
+        legacyPlan.options.routeSearch = SEARCH_TEXT.legacy
         return legacyPlan
     end
-    strictPlan.options.routeSearch = "strict net gold per expected skill point"
+    strictPlan.options.routeSearch = SEARCH_TEXT.strict
     return strictPlan
 end
 
@@ -782,6 +1171,7 @@ function ns.BuildRecipes(req, profile, prices)
             item = product and product.item or nil,
             mid = recipe.mid, grey = recipe.grey, via = availability and availability.via or nil, why = why,
             pattern = availability and availability.pattern and math.floor(availability.pattern[2] + 0.5) or nil,
+            owned = availability and availability.acquisition == "Owned" or nil,
             limited = availability and availability.acquisition == "Vendor" and ns.VendorStock ~= nil
                 and ns.VendorStock(recipe.source, availability.pattern[1], ctx.faction, ctx.seen) ~= nil or nil,
             q = product and itemQuality(ctx.D, product.item) or 1,
@@ -791,6 +1181,7 @@ function ns.BuildRecipes(req, profile, prices)
             colour = ns.Colour(recipe, skill), now = learnable and expectedPoints > 0 or false,
             reagents = reagents, focus = recipe.focus, cooldown = (recipe.cooldown or 0) > 0,
             source = recipe.source, learnSrc = recipe.learnSrc,
+            unconfirmed = recipe.unconfirmed or nil, learnWas = recipe.learnWas,
         })
     end
     table.sort(rows, function(a, b)
@@ -831,7 +1222,7 @@ function ns.BuildSuggest(req, profile, prices)
                 if margin > 0 then
                     count = count + 1
                     table.insert(rows, {
-                        recipe = recipe.name, product = ns.ItemName(ctx.D, product.item), yields = product.qty,
+                        recipe = recipe.name, spell = recipe.spell, product = ns.ItemName(ctx.D, product.item), yields = product.qty,
                         item = product.item, q = itemQuality(ctx.D, product.item),
                         mats = math.floor(materialCost + 0.5), sell = math.floor(net + 0.5), sellHow = how,
                         margin = math.floor(margin + 0.5), perDay = math.floor(soldPerDay * 10 + 0.5) / 10,

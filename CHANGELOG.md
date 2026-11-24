@@ -1,5 +1,25 @@
 # Changes
 
+## 1.12.1
+- The route stays put. It is chosen when you press **Plan** or change the character, profession, skill range or an option, and is then kept: crafting, buying and skill gains update the counts, costs and shopping list, not the recipes or their order. The line at the bottom says `kept until you press Plan`. A kept route survives `/reload` and a look at another profession, and is dropped after 12 hours.
+- Fixed: a route could bounce between two recipes that share a skill range, because a craft that pays for itself made the worse skill-up chance look better.
+- The route leaves a recipe only for one that is at least 10% cheaper per skill point, and one leftover material no longer starts a run.
+- A recipe with a low skill-up chance is used only when it costs under a quarter of the best normal recipe per point.
+- If a trainer does not offer a recipe whose learn rank is not confirmed, the recipe leaves your routes and chat says so. It returns when a trainer lists it.
+- A recipe item you already hold is not charged or listed to buy again, and a recipe you learn counts as known at once.
+- Recipe data rebuilt from client build 1.60.1.71037: 27 recipes changed, mostly the skill at which they turn grey.
+- Fixed: the skill at which a recipe turns green is shown as the game shows it.
+
+## 1.12.0
+- Click a recipe's icon or name on the Route, Recipes or Profit tab and the game's profession window opens at that recipe. Shift-click still links the item.
+
+## 1.11.1
+- Learn ranks for 121 more Blacksmithing, Leatherworking and Tailoring trainer recipes lowered to the rank given in the Classic WoW Forever text. These are estimates and are marked "not confirmed".
+
+## 1.11.0
+- Learn ranks from your trainers: opening a profession trainer's window reads the skill each listed recipe needs, and the addon uses it from then on for every character on the account.
+- 78 trainer learn ranks replaced by the ranks ForeverWowCraft reports as seen at a trainer in the game, marked "not confirmed" until your own trainer visit replaces them.
+
 ## 1.10.0
 - Travel remembers where you walk (not on flights, boats or lifts) and uses those paths for later trips, to cover cities, bridges and tunnels the terrain data does not show. `/pp record` shows how much is recorded, `/pp record off` stops it. It stays in the saved settings on your PC.
 
