@@ -1,5 +1,15 @@
 # Changes
 
+## 1.13.0
+- Materials your profession can make itself (a bolt of cloth, leather, a cured hide, blasting powder, a grinding stone, a bronze tube) are made instead of bought when that is cheaper, and the skill points from making them count towards the route. Before this, every material was priced as bought.
+- Each step lists the base materials and a **Make first** line with what to make from them.
+- What an earlier step made is used by a later step before more is bought. The earlier step says how many to keep instead of sell, and the shopping list says how many come from an earlier step.
+- Only recipes you know, or can learn from a trainer at that skill, are used to make materials.
+- New option **Make materials myself**, on by default. Off gives the 1.12.1 routes.
+- Counts of materials to make are rounded up to whole crafts. Where a recipe makes several at once, the ones left over are not counted for anything.
+- With a kept route, buying a material the route planned to make changes the craft counts of that step; the recipes and their order stay.
+- Tested outside the game only. A full 1 to 300 plan takes about twice as long to work out as in 1.12.1.
+
 ## 1.12.1
 - The route stays put. It is chosen when you press **Plan** or change the character, profession, skill range or an option, and is then kept: crafting, buying and skill gains update the counts, costs and shopping list, not the recipes or their order. The line at the bottom says `kept until you press Plan`. A kept route survives `/reload` and a look at another profession, and is dropped after 12 hours.
 - Fixed: a route could bounce between two recipes that share a skill range, because a craft that pays for itself made the worse skill-up chance look better.

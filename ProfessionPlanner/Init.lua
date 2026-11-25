@@ -1,10 +1,10 @@
 local addonName, ns = ...
 
-ns.VERSION = "1.12.1"
+ns.VERSION = "1.13.0"
 
 -- Option keys that are restored from the saved variables. Character, profession and skill
 -- range are restored separately because they depend on who is logged in.
-local OPTION_KEYS = { "strictCheapest", "patterns", "vendorPatterns", "limitedPatterns", "useStock", "altStock", "ahMode", "credit",
+local OPTION_KEYS = { "strictCheapest", "patterns", "vendorPatterns", "limitedPatterns", "useStock", "altStock", "make", "ahMode", "credit",
     "cooldowns", "stations", "discolored", "simulate", "bothOnly" }
 
 local function currentCharacter()

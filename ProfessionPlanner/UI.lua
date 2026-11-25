@@ -59,6 +59,7 @@ local OPTIONS = {
         set = function(request, on) request.patterns = on and "buyable" or "known" end },
     flag("useStock", "Materials", "Use my stock", "Count materials in this character's bags, bank and mail.", true),
     flag("altStock", "Materials", "Use my alts' stock", "Also count materials held by your other characters.", false),
+    flag("make", "Materials", "Make materials myself", "Make bolts, leather, powder and the like with this profession when that is cheaper than buying them.", true),
     { key = "minimumBuyout", group = "Prices", label = "Price at minimum buyout", hint = "Use the lowest listing instead of TSM's market value.",
         get = function(request) return request.ahMode == "min" end,
         set = function(request, on) request.ahMode = on and "min" or "median" end },
@@ -110,7 +111,7 @@ function ns.DefaultRequest(profile)
     end
     return {
         char = charId, prof = profession, ["from"] = level, to = ns.NextCap(level),
-        strictCheapest = true, patterns = "known", vendorPatterns = true, limitedPatterns = true, useStock = true, altStock = false,
+        strictCheapest = true, patterns = "known", vendorPatterns = true, limitedPatterns = true, useStock = true, altStock = false, make = true,
         ahMode = "median", credit = "vendor", cooldowns = false, stations = false,
         discolored = false, simulate = true, bothOnly = false, exclude = {},
     }
@@ -204,7 +205,7 @@ end
 -- route, because everything in the bags counts as free.) The kept route belongs to one character, profession,
 -- target and set of options: change any of those, or press Plan, and the planner chooses again.
 local ROUTE_KEYS = { "char", "prof", "to", "strictCheapest", "patterns", "vendorPatterns", "limitedPatterns", "useStock",
-    "altStock", "ahMode", "credit", "cooldowns", "stations", "discolored", "bothOnly" }
+    "altStock", "make", "ahMode", "credit", "cooldowns", "stations", "discolored", "bothOnly" }
 ns.KEEP_SECONDS = 12 * 3600
 
 function ns.RouteKey(request)
@@ -1252,12 +1253,29 @@ local function renderRoute(ui, plan, y)
             local materials = {}
             for _, material in ipairs(step.mats or {}) do
                 local entry = material.qty .. " x " .. material.name
-                if (material.own or 0) > 0 then
+                local made = material.made or 0
+                if made > 0 and made == material.qty then
+                    entry = entry .. hex(C.good) .. " (made earlier)" .. DONE
+                elseif made > 0 then
+                    entry = entry .. hex(C.good) .. " (" .. made .. " made earlier, have " .. (material.own or 0) .. ", buy " .. material.buy .. ")" .. DONE
+                elseif (material.own or 0) > 0 then
                     entry = entry .. hex(C.good) .. " (have " .. material.own .. ", buy " .. material.buy .. ")" .. DONE
                 end
                 table.insert(materials, entry)
             end
             if #materials > 0 then cy = cy - put(ui, x, cy, wide, table.concat(materials, "     "), 11, C.text, "LEFT", true) - 4 end
+            if step.makes then
+                -- Materials this profession makes itself: made first, from what the line above lists.
+                local parts = {}
+                for _, sub in ipairs(step.makes) do
+                    local entry = sub.qty .. " x " .. sub.product
+                    if sub.via == "trainer" then
+                        entry = entry .. " (trainer, skill " .. tostring(sub.learn or "?") .. (sub.unconfirmed and ", not confirmed" or "") .. ")"
+                    end
+                    table.insert(parts, entry)
+                end
+                cy = cy - put(ui, x, cy, wide, "Make first, from the materials above: " .. table.concat(parts, ", ") .. ".", 11, C.accent, "LEFT", true) - 4
+            end
             if step.pattern and step.pattern.src == "Owned" then
                 cy = cy - put(ui, x, cy, wide, "You have " .. step.pattern.name .. ": use it to learn this recipe.", 11, C.good, "LEFT", true) - 4
             elseif step.pattern then
@@ -1268,7 +1286,10 @@ local function renderRoute(ui, plan, y)
                 local sell, text = step.sell, nil
                 local what = sell.made .. " x " .. step.product
                 local rate = string.format("%.1f", sell.perDay or 0)
-                if sell.how == "AH" then
+                local keep = (sell.kept or 0) > 0 and ("Keep " .. sell.kept .. " x " .. step.product .. ": a later step uses them.") or nil
+                if keep and sell.made == 0 then
+                    text, keep = keep, nil
+                elseif sell.how == "AH" then
                     text = "Sell on the AH: " .. what .. " for about " .. ns.Coins(sell.ah or 0) .. " after the cut (about " .. rate .. " sell a day)."
                     if sell.vendor > 0 then text = text .. " A vendor pays " .. ns.Coins(sell.vendor) .. "." end
                 elseif sell.how == "vendor" then
@@ -1281,6 +1302,7 @@ local function renderRoute(ui, plan, y)
                 else
                     text = "Sell-back is not counted (see Options)."
                 end
+                if keep then text = keep .. " " .. text end
                 cy = cy - put(ui, x, cy, wide, text, 11, C.dim, "LEFT", true) - 4
             end
             if step.pattern and step.pattern.stock then
@@ -1341,12 +1363,15 @@ local SHOPPING_COLUMNS = {
 local function renderShopping(ui, plan, y)
     local summary, request = plan.summary, ns.request
     y = banner(ui, y, "Buy on the auction house: " .. ns.Coins(summary.buyAH or 0) .. "      Buy from vendors: " .. ns.Coins(summary.buyVendor or 0)
-        .. "\nQuantities are what the route still needs after your own stock.", C.info)
+        .. "\nQuantities are what the route still needs after your own stock and what it makes itself.", C.info)
     if #plan.shopping == 0 then return banner(ui, y, "Nothing to buy for this route.", C.good) end
     y = heading(ui, y, SHOPPING_COLUMNS)
     for index, row in ipairs(plan.shopping) do
         local note
         if row.warn then note = hex(C.warn) .. row.warn .. DONE end
+        if (row.made or 0) > 0 then
+            note = (note and (note .. "     ") or "") .. row.made .. " come from an earlier step of the route."
+        end
         if row.named == false and row.src == "AH" then
             note = (note and (note .. "     ") or "") .. "The game has not seen this item yet, so it is searched by item ID."
         end
@@ -1355,7 +1380,7 @@ local function renderShopping(ui, plan, y)
         rowIcon(ui, 10, y - 3, 20, row.item, row.name)
         local hasSpare = request.simulate and (row.safeBuy or 0) > row.buy
         local source = row.src or "no price"
-        local sourceColour = source == "AH" and C.text or (source == "Vendor" and C.info or (source == "Own stock" and C.good or C.bad))
+        local sourceColour = source == "AH" and C.text or (source == "Vendor" and C.info or ((source == "Own stock" or source == "Made earlier") and C.good or C.bad))
         put(ui, 40, y - 7, 262, row.name, 11, QUALITY[row.q or 1] or C.text)
         rowHit(ui, 34, y - 2, 268, 22, row.item, row.name)
         put(ui, 306, y - 7, 52, tostring(row.need), 11, C.dim, "RIGHT")
@@ -1720,7 +1745,8 @@ local function refreshSummary(ui, request, char, plan)
     ui.cards.sellBack.value:SetText(ns.Coins(summary.sellBack))
     local outlet = request.credit == "ah" and "AH, ELSE VENDOR" or (request.credit == "none" and "NOT COUNTED" or "VENDOR")
     ui.cards.sellBack.caption:SetText("SELL-BACK (" .. outlet .. ")")
-    ui.cards.crafts.value:SetText(tostring(summary.crafts))
+    -- Crafts of the route plus the materials made for them.
+    ui.cards.crafts.value:SetText(tostring(summary.crafts + (summary.madeCrafts or 0)))
 end
 
 function ns.RefreshUI()

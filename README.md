@@ -16,6 +16,7 @@ For auction prices, stock, gold and known recipes you need **TradeSkillMaster 4*
 
 - Cheapest route between any two skill levels, with crafts, materials, sell-back and gold per skill point for every step.
 - Uses what is already in your bags, bank and mail, and optionally your alts'.
+- Makes materials your profession can make itself (bolts of cloth, leather, blasting powder and the like) when that is cheaper than buying them, counts the skill points from making them, and tells you what to make first.
 - Shopping list with a search string to paste into TSM Shopping.
 - Recipes to buy are optional: switch vendor and auction-house recipes on or off and watch the cost change.
 - "Show on map" places the game's own map pin on the vendor that sells a recipe, for your faction.

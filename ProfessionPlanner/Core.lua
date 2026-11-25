@@ -380,6 +380,8 @@ function ns.NewContext(req, profile, prices)
         cooldowns = req.cooldowns == true, stations = req.stations == true,
         discolored = req.discolored == true, useStock = req.useStock ~= false,
         altStock = req.altStock == true, strict = req.strictCheapest ~= false,
+        -- Materials the profession can make itself are made when that is cheaper (ns.Resolve).
+        make = req.make ~= false,
         -- A kept route (see ns.BuildPlan): the recipe for each stretch of skill is fixed, only counts and costs move.
         lock = type(req.lock) == "table" and type(req.lock.steps) == "table" and req.lock or nil,
         known = {}, stock = {}, held = {}, exclude = {}, unitCache = {},
@@ -504,7 +506,196 @@ function ns.Explain(ctx, recipe)
     return nil, "recipe you do not know (AH recipes off)"
 end
 
-function ns.CraftCost(ctx, recipe, stock)
+-- Materials the profession can make itself (bolts of cloth, leather, blasting powder, stones).
+-- ctx.makers[item] lists the recipes of this profession that make the item and that the character can
+-- use without buying a recipe: known, automatic, or taught by a trainer. A cooldown recipe, one the player
+-- avoids and one that needs a station the options leave out are not in the list (ns.Explain says no).
+function ns.Makers(ctx)
+    if ctx.makers then return ctx.makers end
+    local makers, reagentOf = {}, {}
+    ctx.makers, ctx.reagentOf = makers, reagentOf
+    for _, recipe in ipairs(ctx.D.by_prof[ctx.prof]) do
+        for _, reagent in ipairs(recipe.reagents or {}) do reagentOf[reagent.item] = true end
+    end
+    if not ctx.make then return makers end
+    for _, recipe in ipairs(ctx.D.by_prof[ctx.prof]) do
+        local product = recipe.products and recipe.products[1]
+        if product and (product.qty or 0) > 0 and reagentOf[product.item] and #(recipe.reagents or {}) > 0 then
+            local availability = ns.Explain(ctx, recipe)
+            local via = availability and availability.via
+            if via == "known" or via == "auto" or via == "trainer" then
+                local list = makers[product.item]
+                if not list then list = {}; makers[product.item] = list end
+                table.insert(list, { recipe = recipe, via = via, qty = product.qty, item = product.item })
+            end
+        end
+    end
+    return makers
+end
+
+local MAKE_DEPTH = 3
+local NO_CLAIM = { take = {}, made = {} }
+
+local function newOut()
+    return { buy = 0, forfeit = 0, shadow = 0, points = 0, take = {}, made = {}, purch = {}, subs = {}, order = {} }
+end
+
+local function copyOut(out)
+    local copy = { buy = out.buy, forfeit = out.forfeit, shadow = out.shadow, points = out.points, optional = out.optional,
+        take = {}, made = {}, purch = {}, subs = {}, order = {} }
+    for _, key in ipairs({ "take", "made", "purch" }) do
+        for itemId, quantity in pairs(out[key]) do copy[key][itemId] = quantity end
+    end
+    for spell, sub in pairs(out.subs) do copy.subs[spell] = { recipe = sub.recipe, crafts = sub.crafts, qty = sub.qty, item = sub.item, via = sub.via } end
+    for index, spell in ipairs(out.order) do copy.order[index] = spell end
+    return copy
+end
+
+local resolveNeed
+
+-- `need` of an item that the bags do not cover: made now, or taken at `altUnit` each. The alternative is
+-- buying (fromMade false) or using what an earlier step made, at the sell-back given up (fromMade true);
+-- altUnit nil means there is no alternative. Returns false when it can be neither.
+local function obtain(ctx, state, claim, out, itemId, need, altUnit, fromMade, skill, threshold, depth, path)
+    local best, bestCost
+    local makers = depth < MAKE_DEPTH and not path[itemId] and ns.Makers(ctx)[itemId] or nil
+    if makers then
+        path[itemId] = true
+        for _, maker in ipairs(makers) do
+            local recipe = maker.recipe
+            if maker.via ~= "trainer" or recipe.learn <= skill then
+                local crafts = need / maker.qty
+                local trial, possible = copyOut(out), true
+                for _, reagent in ipairs(recipe.reagents) do
+                    if not resolveNeed(ctx, state, claim, trial, reagent.item, reagent.qty * crafts, skill, threshold, depth + 1, path) then
+                        possible = false
+                        break
+                    end
+                end
+                if possible then
+                    local cost = (trial.buy + trial.forfeit) - (out.buy + out.forfeit)
+                    if not best or cost < bestCost - 1e-9 or (math.abs(cost - bestCost) <= 1e-9 and recipe.spell < best.recipe.spell) then
+                        local sub = trial.subs[recipe.spell]
+                        if not sub then
+                            sub = { recipe = recipe, crafts = 0, qty = 0, item = itemId, via = maker.via }
+                            trial.subs[recipe.spell] = sub
+                            table.insert(trial.order, recipe.spell)
+                        end
+                        sub.crafts, sub.qty = sub.crafts + crafts, sub.qty + crafts * maker.qty
+                        local points = crafts * ns.SkillChance(recipe, skill) * (recipe.skillups or 1)
+                        trial.points = trial.points + points
+                        best, bestCost = { recipe = recipe, trial = trial, points = points }, cost
+                    end
+                end
+            end
+        end
+        path[itemId] = nil
+    end
+    local make = false
+    if best then
+        if not altUnit then
+            make = true
+        else
+            local extra = bestCost - need * altUnit
+            if extra <= 1e-9 then
+                make = true
+            elseif best.points > 0 then
+                -- Dearer than the alternative, but it gives skill points.
+                if threshold then make = extra / best.points < threshold - 1e-9 else out.optional = true end
+            end
+        end
+    end
+    if make then
+        for key, value in pairs(best.trial) do out[key] = value end
+        return true
+    end
+    if not altUnit then return false end
+    if fromMade then
+        out.made[itemId] = (out.made[itemId] or 0) + need
+        out.forfeit = out.forfeit + need * altUnit
+    else
+        out.buy = out.buy + need * altUnit
+        out.purch[itemId] = (out.purch[itemId] or 0) + need
+    end
+    return true
+end
+
+-- Fills `out` with the cheapest way to get `quantity` of an item at this skill: own stock, then what earlier
+-- steps made (their sell-back is given up), making it, or buying it. Crafts of a material are counted in
+-- fractions (a recipe that makes two covers half a craft each), as skill points are. Returns false when the
+-- item can be neither bought nor made. `threshold` is a cost per skill point: making that costs more than
+-- the alternative is still chosen when the skill points it gives come cheaper than that.
+resolveNeed = function(ctx, state, claim, out, itemId, quantity, skill, threshold, depth, path)
+    local unit = ns.UnitCost(ctx, itemId)
+    local need = quantity
+    local own = math.min((state.stock[itemId] or 0) - (claim.take[itemId] or 0) - (out.take[itemId] or 0), need)
+    if own > 0 then
+        out.take[itemId] = (out.take[itemId] or 0) + own
+        if unit then out.shadow = out.shadow + own * unit * ns.STOCK_SHADOW end
+        need = need - own
+    end
+    if need <= 0 then return true end
+    local made = math.min((state.made[itemId] or 0) - (claim.made[itemId] or 0) - (out.made[itemId] or 0), need)
+    if made > 0 then
+        local value = ns.SellValue(ctx, itemId, 1)
+        if not unit or value <= unit then
+            if not obtain(ctx, state, claim, out, itemId, made, value, true, skill, threshold, depth, path) then return false end
+            need = need - made
+        end
+    end
+    if need <= 0 then return true end
+    return obtain(ctx, state, claim, out, itemId, need, unit, false, skill, threshold, depth, path)
+end
+
+local function resolveOnce(ctx, state, claim, recipe, skill, threshold)
+    local out = newOut()
+    for _, reagent in ipairs(recipe.reagents or {}) do
+        if not resolveNeed(ctx, state, claim, out, reagent.item, reagent.qty, skill, threshold, 0, {}) then return nil end
+    end
+    return out
+end
+
+-- One craft of `recipe` at whole skill `skill`, with the materials it would use and from where.
+-- state = { stock, made }: what is owned and what earlier steps of the route made. claim = quantities of
+-- those already spoken for. Returns nil when a material has no source.
+-- Fields: net, buy, credit, effective (as ns.CraftCost), forfeit (sell-back given up on items made earlier),
+-- points (expected skill points from making materials), chance (the recipe's own expected points).
+function ns.Resolve(ctx, state, recipe, skill, claim)
+    claim = claim or NO_CLAIM
+    local chance = ns.SkillChance(recipe, skill) * (recipe.skillups or 1)
+    local credit = 0
+    for _, product in ipairs(recipe.products or {}) do
+        credit = credit + ns.SellValue(ctx, product.item, product.qty)
+    end
+    local out = resolveOnce(ctx, state, claim, recipe, skill, nil)
+    if not out then return nil end
+    if out.optional then
+        -- Making a material costs more than buying it here but gives skill points. It is worth it when
+        -- those points come cheaper than the craft's own; a craft that pays for itself makes them as long
+        -- as it still pays.
+        local total = chance + out.points
+        local base = total > 0 and (out.buy + out.forfeit - credit) / total or math.huge
+        local second = resolveOnce(ctx, state, claim, recipe, skill, base > 0 and base or math.huge)
+        if second and (base > 0 or second.buy + second.forfeit - credit <= 0) then out = second end
+    end
+    out.credit, out.chance = credit, chance
+    out.net = out.buy + out.forfeit - credit
+    out.effective = out.net + out.shadow
+    return out
+end
+
+local function stateOf(stock)
+    return { stock = stock, made = NO_CLAIM.take }
+end
+
+-- Cost of one craft: net, to buy, sell-back, and the cost with own stock charged at ns.STOCK_SHADOW.
+-- `stock` is a plain table of owned items; with `skill` the materials may also be made (ns.Resolve).
+function ns.CraftCost(ctx, recipe, stock, skill)
+    if skill and ctx.make then
+        local out = ns.Resolve(ctx, stateOf(stock), recipe, skill)
+        if not out then return math.huge, math.huge, 0, math.huge end
+        return out.net, out.buy + out.forfeit, out.credit, out.effective
+    end
     local buy, shadow = 0, 0
     for _, reagent in ipairs(recipe.reagents or {}) do
         local itemId, quantity = reagent.item, reagent.qty
@@ -523,6 +714,40 @@ function ns.CraftCost(ctx, recipe, stock)
         credit = credit + value
     end
     return buy - credit, buy, credit, buy + shadow - credit
+end
+
+local function addClaim(claim, out)
+    for _, key in ipairs({ "take", "made" }) do
+        for itemId, quantity in pairs(out[key]) do claim[key][itemId] = (claim[key][itemId] or 0) + quantity end
+    end
+end
+
+-- ns.Resolve averaged over the next MIN_RUN crafts, like ns.RunCost: the first craft's materials and points,
+-- with net and effective as the average. Only when something it uses is partly in stock.
+local function resolveRun(ctx, state, recipe, skill)
+    local first = ns.Resolve(ctx, state, recipe, skill)
+    if not first then return nil end
+    local partly = false
+    for itemId, taken in pairs(first.take) do
+        if taken > 0 and (state.stock[itemId] or 0) < taken * ns.MIN_RUN then partly = true; break end
+    end
+    if not partly then
+        for itemId, taken in pairs(first.made) do
+            if taken > 0 and (state.made[itemId] or 0) < taken * ns.MIN_RUN then partly = true; break end
+        end
+    end
+    if not partly then return first end
+    local claim = { take = {}, made = {} }
+    local netSum, effectiveSum, pointSum = first.net, first.effective, first.points
+    addClaim(claim, first)
+    for _ = 2, ns.MIN_RUN do
+        local one = ns.Resolve(ctx, state, recipe, skill, claim)
+        if not one then return nil end
+        netSum, effectiveSum, pointSum = netSum + one.net, effectiveSum + one.effective, pointSum + one.points
+        addClaim(claim, one)
+    end
+    first.net, first.effective, first.points = netSum / ns.MIN_RUN, effectiveSum / ns.MIN_RUN, pointSum / ns.MIN_RUN
+    return first
 end
 
 -- ns.CraftCost averaged over the next MIN_RUN crafts, for a recipe the route is not on yet. One leftover
@@ -619,8 +844,48 @@ function ns.StopReasons(ctx, skill, stock)
     return text
 end
 
-local function closeStep(items, step, skill)
+-- Quantities made for a step are counted in fractions; what is shown and bought is whole.
+local function whole(quantity)
+    return math.ceil(quantity - 1e-9)
+end
+
+-- Materials made for a step are counted in fractions while the route is chosen (a recipe that makes five
+-- covers a fifth of a craft each). The player crafts whole ones: each count is rounded up here and what the
+-- extra part needs is added to the step. What is left over of the made material is not counted for anything.
+local function wholeSubs(ctx, step)
+    local byItem = {}
+    for _, spell in ipairs(step.subOrder) do byItem[step.subs[spell].item] = step.subs[spell] end
+    for _ = 1, 6 do
+        local changed = false
+        for index = #step.subOrder, 1, -1 do
+            local sub = step.subs[step.subOrder[index]]
+            local extra = whole(sub.crafts) - sub.crafts
+            if extra > 1e-9 then
+                changed = true
+                local yield = sub.qty / sub.crafts
+                sub.crafts, sub.qty = sub.crafts + extra, sub.qty + extra * yield
+                for _, reagent in ipairs(sub.recipe.reagents) do
+                    local need = reagent.qty * extra
+                    local child = byItem[reagent.item]
+                    if child and child ~= sub then
+                        child.crafts, child.qty = child.crafts + need / (child.qty / child.crafts), child.qty + need
+                    else
+                        step.use[reagent.item] = (step.use[reagent.item] or 0) + need
+                        local unit = ns.UnitCost(ctx, reagent.item)
+                        if unit then step.buyCost = step.buyCost + need * unit end
+                    end
+                end
+            end
+        end
+        if not changed then break end
+    end
+end
+
+ns.WholeSubs = wholeSubs
+
+local function closeStep(items, step, skill, ctx)
     if step then
+        if ctx and step.subOrder then ns.WholeSubs(ctx, step) end
         step.endSkill = skill
         table.insert(items, step)
     end
@@ -656,6 +921,9 @@ end
 function ns.PlanRoute(ctx, fromSkill, toSkill)
     local stock = {}
     for itemId, quantity in pairs(ctx.stock) do stock[itemId] = quantity end
+    -- made: what earlier steps of this route produced and a later step can use instead of selling.
+    local state = { stock = stock, made = {} }
+    ns.Makers(ctx)
     local candidates = {}
     for _, recipe in ipairs(ctx.D.by_prof[ctx.prof]) do
         local availability = ns.Explain(ctx, recipe)
@@ -681,11 +949,18 @@ function ns.PlanRoute(ctx, fromSkill, toSkill)
         for _, candidate in ipairs(candidates) do
             local recipe, availability = candidate.recipe, candidate.availability
             if (availability.via == "known" or availability.via == "auto") or recipe.learn <= integerSkill then
-                local expectedPoints = ns.SkillChance(recipe, integerSkill) * recipe.skillups
-                if expectedPoints > 0 then
-                    local cost = (current and current.recipe.spell == recipe.spell) and ns.CraftCost or ns.RunCost
-                    local net, _, _, effective = cost(ctx, recipe, stock)
-                    if effective ~= math.huge then
+                local ownPoints = ns.SkillChance(recipe, integerSkill) * recipe.skillups
+                if ownPoints > 0 then
+                    local resolved
+                    if current and current.recipe.spell == recipe.spell then
+                        resolved = ns.Resolve(ctx, state, recipe, integerSkill)
+                    else
+                        resolved = resolveRun(ctx, state, recipe, integerSkill)
+                    end
+                    if resolved then
+                        local net, effective = resolved.net, resolved.effective
+                        -- Making a material gives skill points too; they count towards the craft.
+                        local expectedPoints = ownPoints + resolved.points
                         local patternCost = 0
                         if availability.pattern and not boughtPatterns[recipe.spell] then
                             local span = math.max(1, math.min(toSkill, recipe.grey) - integerSkill)
@@ -709,7 +984,7 @@ function ns.PlanRoute(ctx, fromSkill, toSkill)
                         -- same one whether the materials are owned or still to buy.
                         entry.fullRank = entry.rank
                         if entry.rank <= 0 then
-                            local full = ns.CraftCost(ctx, recipe, NO_STOCK)
+                            local full = ns.CraftCost(ctx, recipe, NO_STOCK, integerSkill)
                             entry.fullRank = math.max((full + patternCost) / expectedPoints, 0)
                         end
                         table.insert(scored, entry)
@@ -733,7 +1008,7 @@ function ns.PlanRoute(ctx, fromSkill, toSkill)
                 if not keep and bestDecent > 0 and entry.expectedPoints >= ns.GRIND_FLOOR then
                     -- The grind is judged at full price: materials already owned must not make a nearly grey
                     -- recipe look free, or the route would burn the bags on it.
-                    local full = ns.CraftCost(ctx, entry.recipe, NO_STOCK)
+                    local full = ns.CraftCost(ctx, entry.recipe, NO_STOCK, integerSkill)
                     local pattern = entry.perCraft - (ctx.strict and entry.net or entry.effective)
                     keep = math.max((full + pattern) / entry.expectedPoints, 0) < ns.GRIND_RATIO * bestDecent
                 end
@@ -778,7 +1053,7 @@ function ns.PlanRoute(ctx, fromSkill, toSkill)
         run = run + 1
         current = { recipe = recipe, availability = availability }
         if not step or step.spell ~= recipe.spell then
-            closeStep(items, step, skill)
+            closeStep(items, step, skill, ctx)
             local alternatives = {}
             for _, entry in ipairs(filtered) do
                 if entry.spell ~= recipe.spell and #alternatives < 3 then
@@ -787,7 +1062,8 @@ function ns.PlanRoute(ctx, fromSkill, toSkill)
             end
             step = {
                 type = "step", spell = recipe.spell, recipeData = recipe, availability = availability,
-                startSkill = skill, crafts = 0, use = {}, stockUsed = {}, buyCost = 0, credit = 0,
+                startSkill = skill, crafts = 0, use = {}, stockUsed = {}, madeUsed = {}, subs = {}, subOrder = {},
+                subPoints = 0, buyCost = 0, credit = 0, forfeit = 0,
                 patternCost = 0, colourStart = ns.Colour(recipe, integerSkill), score = pick.rank, alts = alternatives,
             }
             if availability.pattern and not boughtPatterns[recipe.spell] then
@@ -796,27 +1072,56 @@ function ns.PlanRoute(ctx, fromSkill, toSkill)
                 step.patternItem = availability.pattern[1]
             end
         end
-        local _, buy, credit = ns.CraftCost(ctx, recipe, stock)
-        for _, reagent in ipairs(recipe.reagents or {}) do
-            local itemId = reagent.item
-            local have = stock[itemId] or 0
-            local take = math.min(have, reagent.qty)
-            if take > 0 then
-                stock[itemId] = have - take
-                step.stockUsed[itemId] = (step.stockUsed[itemId] or 0) + take
+        -- This one craft, as it will be done: what comes from the bags, what an earlier step made, what is
+        -- made for it now and what is bought.
+        local done = ns.Resolve(ctx, state, recipe, integerSkill)
+        for itemId, quantity in pairs(done.take) do
+            stock[itemId] = (stock[itemId] or 0) - quantity
+            step.stockUsed[itemId] = (step.stockUsed[itemId] or 0) + quantity
+            step.use[itemId] = (step.use[itemId] or 0) + quantity
+        end
+        for itemId, quantity in pairs(done.made) do
+            state.made[itemId] = (state.made[itemId] or 0) - quantity
+            step.madeUsed[itemId] = (step.madeUsed[itemId] or 0) + quantity
+            step.use[itemId] = (step.use[itemId] or 0) + quantity
+        end
+        for itemId, quantity in pairs(done.purch) do
+            step.use[itemId] = (step.use[itemId] or 0) + quantity
+        end
+        for _, spell in ipairs(done.order) do
+            local sub, kept = done.subs[spell], step.subs[spell]
+            if not kept then
+                kept = { recipe = sub.recipe, crafts = 0, qty = 0, item = sub.item, via = sub.via }
+                step.subs[spell] = kept
+                table.insert(step.subOrder, spell)
             end
-            step.use[itemId] = (step.use[itemId] or 0) + reagent.qty
+            kept.crafts, kept.qty = kept.crafts + sub.crafts, kept.qty + sub.qty
+        end
+        if ctx.make then
+            for _, product in ipairs(recipe.products or {}) do
+                if ctx.reagentOf[product.item] then
+                    state.made[product.item] = (state.made[product.item] or 0) + product.qty
+                end
+            end
         end
         step.crafts = step.crafts + 1
-        step.buyCost = step.buyCost + buy
-        step.credit = step.credit + credit
+        -- For the tests: the whole skill at which each craft was chosen. A craft whose materials are made
+        -- on the way can gain more than a point, so not every skill level sees a choice.
+        if ctx.req.trace then
+            step.trace = step.trace or {}
+            table.insert(step.trace, integerSkill)
+        end
+        step.buyCost = step.buyCost + done.buy
+        step.forfeit = step.forfeit + done.forfeit
+        step.credit = step.credit + done.credit
+        step.subPoints = step.subPoints + done.points
         step.colourEnd = ns.Colour(recipe, integerSkill)
-        skill = skill + expectedPoints
+        skill = skill + done.chance + done.points
         crafts = crafts + 1
         local cap = caps[capIndex]
         if cap and skill >= cap then
             skill = cap + 0.0
-            closeStep(items, step, skill)
+            closeStep(items, step, skill, ctx)
             step = nil
             table.insert(items, { type = "note", at = cap, text = ns.CAP_NOTES[cap] })
             capIndex = capIndex + 1
@@ -824,7 +1129,7 @@ function ns.PlanRoute(ctx, fromSkill, toSkill)
         end
     end
     if skill > toSkill then skill = toSkill + 0.0 end
-    closeStep(items, step, skill)
+    closeStep(items, step, skill, ctx)
     if stoppedAt then
         table.insert(warnings, "No usable recipe at skill " .. stoppedAt .. ". What still gives skill here is out: "
             .. ns.StopReasons(ctx, stoppedAt, stock) .. ".")
@@ -858,7 +1163,8 @@ local function buildPlanSingle(req, profile, prices)
             table.insert(routeLock.steps, { spell = item.spell, s = item.startSkill, e = item.endSkill })
         end
     end
-    local outSteps, totalNeed, totalStock, patternRows = {}, {}, {}, {}
+    local outSteps, totalNeed, totalStock, totalMade, patternRows = {}, {}, {}, {}, {}
+    local madeLeft, madeCrafts = {}, 0
     local spendPatterns, totalCredit, totalCrafts, previousEnd = 0, 0, 0, fromSkill
     local lastStep
     for _, item in ipairs(items) do if item.type == "step" then lastStep = item end end
@@ -873,19 +1179,40 @@ local function buildPlanSingle(req, profile, prices)
             previousEnd = endSkill
             local materials = {}
             for _, itemId in ipairs(sortedMaterialIds(item.use)) do
-                local quantity = item.use[itemId]
-                local own = item.stockUsed[itemId] or 0
-                local buy = quantity - own
+                local quantity = whole(item.use[itemId])
+                local own = math.min(quantity, whole(item.stockUsed[itemId] or 0))
+                local made = math.min(quantity - own, whole(item.madeUsed[itemId] or 0))
+                local buy = quantity - own - made
                 local unit, sourceName = ns.UnitCost(ctx, itemId)
                 table.insert(materials, {
                     item = itemId, name = ns.ItemName(ctx.D, itemId), qty = quantity, own = own, buy = buy,
-                    unit = unit and math.floor(unit + 0.5) or nil, src = buy == 0 and "Own stock" or sourceName,
+                    made = made > 0 and made or nil,
+                    unit = unit and math.floor(unit + 0.5) or nil,
+                    src = buy > 0 and sourceName or (made > 0 and own == 0 and "Made earlier" or "Own stock"),
                 })
                 totalNeed[itemId] = (totalNeed[itemId] or 0) + quantity
                 totalStock[itemId] = (totalStock[itemId] or 0) + own
+                totalMade[itemId] = (totalMade[itemId] or 0) + made
             end
+            for itemId, quantity in pairs(item.madeUsed) do madeLeft[itemId] = (madeLeft[itemId] or 0) + quantity end
+            -- Materials made for this step from what the list above holds: made first, then the craft.
+            local makes
+            for _, spell in ipairs(item.subOrder) do
+                local sub = item.subs[spell]
+                local count = whole(sub.crafts)
+                makes = makes or {}
+                madeCrafts = madeCrafts + count
+                table.insert(makes, {
+                    spell = spell, recipe = sub.recipe.name, crafts = count, item = sub.item,
+                    product = ns.ItemName(ctx.D, sub.item), qty = whole(sub.qty), via = sub.via, learn = sub.recipe.learn,
+                    unconfirmed = sub.recipe.unconfirmed and sub.via == "trainer" or nil,
+                    q = (ctx.D["items"][sub.item] or {}).q or 1,
+                })
+            end
+            -- Items an earlier step made and this one uses cost this step nothing; the step that made them
+            -- loses their sell-back (below, once every step is known).
             local stepCost = item.buyCost + item.patternCost - item.credit
-            totalCredit = totalCredit + item.credit
+            totalCredit = totalCredit + item.credit - item.forfeit
             totalCrafts = totalCrafts + item.crafts
             spendPatterns = spendPatterns + item.patternCost
             local product = recipe.products and recipe.products[1] or nil
@@ -927,8 +1254,10 @@ local function buildPlanSingle(req, profile, prices)
                 source = recipe.source, yields = product and product.qty or 0,
                 product = product and ns.ItemName(ctx.D, product.item) or nil,
                 productItem = product and product.item or nil,
-                tools = recipe.tools, focus = recipe.focus, mats = materials, pattern = pattern,
+                tools = recipe.tools, focus = recipe.focus, mats = materials, pattern = pattern, makes = makes,
+                use = item.use, subPoints = item.subPoints, trace = item.trace,
                 cost = math.floor(stepCost + 0.5), credit = math.floor(item.credit + 0.5),
+                rawCost = stepCost, rawCredit = item.credit,
                 pay = math.floor(item.buyCost + item.patternCost + 0.5),
                 yellow = recipe.yellow, mid = recipe.mid, grey = recipe.grey,
                 q = product and (ctx.D["items"][product.item] or {}).q or 1,
@@ -936,21 +1265,42 @@ local function buildPlanSingle(req, profile, prices)
             })
         end
     end
+    -- Items a later step uses are not sold: the step that made them shows only what is left to sell.
+    for _, step in ipairs(outSteps) do
+        local sell = step.type == "step" and step.sell
+        local left = sell and step.productItem and madeLeft[step.productItem] or 0
+        if left > 1e-9 and sell.made > 0 then
+            local kept = math.min(left, sell.made)
+            local share = (sell.made - kept) / sell.made
+            local lost = ns.SellValue(ctx, step.productItem, 1) * kept
+            madeLeft[step.productItem] = left - kept
+            sell.kept = math.min(whole(kept), sell.made)
+            sell.made = sell.made - sell.kept
+            sell.vendor = math.floor(sell.vendor * share + 0.5)
+            if sell.ah then sell.ah = math.floor(sell.ah * share + 0.5) end
+            step.rawCost, step.rawCredit = step.rawCost + lost, step.rawCredit - lost
+            step.cost, step.credit = math.floor(step.rawCost + 0.5), math.floor(step.rawCredit + 0.5)
+            step.perPoint = math.floor(step.rawCost / math.max(1, step.to - step["from"]) + 0.5)
+        end
+    end
     local safeNeed = {}
     if req.simulate then safeNeed = ns.SimulateRoute(ctx, outSteps) end
     local shopping, spendMaterials, thinSupply = {}, 0, 0
     for itemId, need in pairs(totalNeed) do
         local own = totalStock[itemId] or 0
-        local buy = need - own
+        local made = totalMade[itemId] or 0
+        local buy = need - own - made
         local unit, sourceName = ns.UnitCost(ctx, itemId)
         local cost = unit and buy > 0 and buy * unit or 0
         spendMaterials = spendMaterials + cost
         local record = ctx.prices and ctx.prices.rec(itemId) or nil
         local safeQuantity = math.max(need, safeNeed[itemId] or need)
-        local safeBuy = math.max(buy, safeQuantity - (ctx.stock[itemId] or 0))
+        local safeBuy = math.max(buy, safeQuantity - (ctx.stock[itemId] or 0) - made)
         local row = {
             item = itemId, name = ns.ItemName(ctx.D, itemId), need = need, own = own, buy = buy,
-            unit = unit and math.floor(unit + 0.5) or nil, src = buy == 0 and "Own stock" or sourceName,
+            made = made > 0 and made or nil,
+            unit = unit and math.floor(unit + 0.5) or nil,
+            src = buy > 0 and sourceName or (made > 0 and own == 0 and "Made earlier" or "Own stock"),
             cost = math.floor(cost + 0.5), q = (ctx.D["items"][itemId] or {}).q or 1,
             safeBuy = safeBuy, safeCost = unit and safeBuy > 0 and math.floor(safeBuy * unit + 0.5) or 0,
         }
@@ -1028,7 +1378,7 @@ local function buildPlanSingle(req, profile, prices)
         steps = outSteps, shopping = shopping,
         tsmString = ns.TSMShoppingString and ns.TSMShoppingString(shopping, req.simulate == true) or "",
         summary = {
-            crafts = totalCrafts, spend = math.floor(spend + 0.5), sellBack = math.floor(totalCredit + 0.5),
+            crafts = totalCrafts, madeCrafts = madeCrafts, spend = math.floor(spend + 0.5), sellBack = math.floor(totalCredit + 0.5),
             net = math.floor(spend - totalCredit + 0.5), spendPatterns = math.floor(spendPatterns + 0.5),
             stockUsed = stockUsed, buyAH = math.floor(buyAH + 0.5), buyVendor = math.floor(buyVendor + 0.5),
             safeSpend = math.floor(safeSpend + 0.5), safeCrafts = safeCrafts, thinSupply = thinSupply,
@@ -1036,6 +1386,7 @@ local function buildPlanSingle(req, profile, prices)
         wallet = wallet, excluded = excluded, warnings = warnings,
         lock = routeLock, lockBroken = ctx.lockBroken,
         options = { stock = ctx.useStock and next(ctx.stock) ~= nil, char = ctx.char, strictCheapest = ctx.strict,
+            make = ctx.make,
             vendorPatterns = ctx.vendorPatterns, ahPatterns = ctx.ahPatterns },
         prices = { source = prices and prices.source or "Vendor only" },
     }
@@ -1103,7 +1454,8 @@ function ns.SimulateRoute(ctx, steps)
             for _, candidate in ipairs(ctx.D.by_prof[ctx.prof]) do
                 if candidate.spell == step.spell then recipe = candidate; break end
             end
-            if recipe then table.insert(legs, { recipe = recipe, ["from"] = step["from"], to = step.to, expected = step.crafts, step = step }) end
+            if recipe then table.insert(legs, { recipe = recipe, ["from"] = step["from"], to = step.to, expected = step.crafts, step = step,
+                extra = step.crafts > 0 and (step.subPoints or 0) / step.crafts or 0 }) end
         end
     end
     local runs, seed = 120, 7
@@ -1122,11 +1474,19 @@ function ns.SimulateRoute(ctx, steps)
                 if chance <= 0 then break end
                 count = count + 1
                 if chance >= 1 or random() < chance then skill = skill + leg.recipe.skillups end
+                skill = skill + leg.extra
             end
             if leg.to <= leg["from"] then count = leg.expected end
             perLeg[index][run] = count
-            for _, reagent in ipairs(leg.recipe.reagents or {}) do
-                needed[reagent.item] = (needed[reagent.item] or 0) + reagent.qty * count
+            -- What the step uses per craft, with materials it makes itself counted as their own materials.
+            if leg.step.use and leg.expected > 0 then
+                for itemId, quantity in pairs(leg.step.use) do
+                    needed[itemId] = (needed[itemId] or 0) + whole(quantity * count / leg.expected)
+                end
+            else
+                for _, reagent in ipairs(leg.recipe.reagents or {}) do
+                    needed[reagent.item] = (needed[reagent.item] or 0) + reagent.qty * count
+                end
             end
         end
         for itemId, quantity in pairs(needed) do
